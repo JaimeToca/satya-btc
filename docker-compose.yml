@@ -1,0 +1,35 @@
+# Runs btc-indexer against a Bitcoin Core node.
+#
+# The node is NOT part of this compose file — point the indexer at your existing
+# node via BTC_RPC_URL. Auth is either a mounted cookie file (default below) or
+# BTC_RPC_USER / BTC_RPC_PASS.
+#
+#   docker compose up --build
+#   curl -s localhost:8080/health | jq
+#
+# `restart: unless-stopped` pairs with the app's design: if the sync thread
+# panics the process exits, and the container is restarted automatically.
+
+services:
+  btc-indexer:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      # Reach a node running on the Docker host. For a node in another container,
+      # use its service name, e.g. http://bitcoind:8332
+      BTC_RPC_URL: "${BTC_RPC_URL:-http://host.docker.internal:8332}"
+      # Cookie auth (default): mounted below. Or comment these two out and set
+      # BTC_RPC_USER / BTC_RPC_PASS instead.
+      BTC_RPC_COOKIE_FILE: "/cookie/.cookie"
+      HTTP_BIND: "0.0.0.0:8080"
+      RUST_LOG: "${RUST_LOG:-info}"
+      # POLL_INTERVAL_MS: "2000"
+      # RPC_TIMEOUT_SECS: "30"
+    volumes:
+      # Mount the node's data dir (read-only) so the indexer can read .cookie.
+      - "${BITCOIN_DATADIR:-~/.bitcoin}:/cookie:ro"
+    extra_hosts:
+      # Lets host.docker.internal resolve to the host on Linux.
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

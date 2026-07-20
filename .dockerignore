@@ -1,0 +1,9 @@
+/target
+.git
+.gitignore
+.superpowers
+docs
+*.md
+Dockerfile
+.dockerignore
+docker-compose.yml
