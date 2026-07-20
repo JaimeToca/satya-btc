@@ -21,7 +21,17 @@ async fn main() -> anyhow::Result<()> {
     // Sync loop on its own OS thread (blocking RPC client).
     let sync_state = state.clone();
     let poll = cfg.poll_interval;
-    std::thread::spawn(move || sync::run(rpc, sync_state, poll));
+    let sync_handle = std::thread::spawn(move || sync::run(rpc, sync_state, poll));
+
+    // sync::run only returns via panic (it's an infinite loop). Supervise the
+    // thread off-runtime: if it ever ends, the process is silently frozen but
+    // still reporting `/health`, which is worse than a clean exit. Log and
+    // terminate so a process supervisor (systemd/docker) restarts us.
+    tokio::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || sync_handle.join()).await;
+        tracing::error!("sync thread exited unexpectedly; shutting down");
+        std::process::exit(1);
+    });
 
     let listener = tokio::net::TcpListener::bind(cfg.http_bind).await?;
     tracing::info!("listening on http://{}", cfg.http_bind);
