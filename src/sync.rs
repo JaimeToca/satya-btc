@@ -16,23 +16,23 @@ const MASS_DROP_RATIO: f64 = 0.2;
 const MASS_DROP_MIN_CACHE_SIZE: usize = 100;
 
 /// Blocking loop; call on a dedicated std::thread. Never returns under normal operation.
-pub fn run(rpc: Rpc, state: SharedState, poll_interval: Duration) {
+pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
     // --- Startup: wait for the node's mempool to finish loading. ---
     loop {
-        match rpc.mempool_loaded() {
-            Ok(true) => break,
-            Ok(false) => {
+        match rpc.mempool_info() {
+            Ok(info) if info.loaded => break,
+            Ok(_) => {
                 tracing::info!("waiting for node mempool to finish loading");
             }
             Err(e) => {
-                tracing::warn!(error = %e, "error checking mempool_loaded during startup");
+                tracing::warn!(error = %e, "error checking mempool_info during startup");
             }
         }
         sleep(poll_interval);
     }
 
     // --- Initial bulk load. ---
-    bulk_load(&rpc, &state, poll_interval);
+    bulk_load(&mut rpc, &state, poll_interval);
 
     // --- Steady-state loop. ---
     loop {
@@ -46,10 +46,10 @@ pub fn run(rpc: Rpc, state: SharedState, poll_interval: Duration) {
             }
         };
 
-        let loaded = match rpc.mempool_loaded() {
-            Ok(loaded) => loaded,
+        let loaded = match rpc.mempool_info() {
+            Ok(info) => info.loaded,
             Err(e) => {
-                tracing::warn!(error = %e, "mempool_loaded check failed");
+                tracing::warn!(error = %e, "mempool_info check failed");
                 continue;
             }
         };
@@ -106,10 +106,10 @@ pub fn run(rpc: Rpc, state: SharedState, poll_interval: Duration) {
             continue;
         }
 
-        let min_fee = match rpc.mempool_min_fee_sat_vb() {
-            Ok(fee) => fee,
+        let min_fee = match rpc.mempool_info() {
+            Ok(info) => info.min_fee_sat_vb,
             Err(e) => {
-                tracing::warn!(error = %e, "mempool_min_fee_sat_vb failed");
+                tracing::warn!(error = %e, "mempool_info failed");
                 continue;
             }
         };
@@ -142,7 +142,7 @@ pub fn run(rpc: Rpc, state: SharedState, poll_interval: Duration) {
 /// Fetch the full mempool from the node and replace the in-memory cache wholesale.
 /// Retries indefinitely (on `poll_interval`) until it succeeds, since the caller
 /// depends on a fully-populated cache before entering steady state.
-fn bulk_load(rpc: &Rpc, state: &SharedState, poll_interval: Duration) {
+fn bulk_load(rpc: &mut Rpc, state: &SharedState, poll_interval: Duration) {
     loop {
         let loaded = match rpc.raw_mempool_verbose() {
             Ok(entries) => entries,
@@ -152,10 +152,10 @@ fn bulk_load(rpc: &Rpc, state: &SharedState, poll_interval: Duration) {
                 continue;
             }
         };
-        let min_fee = match rpc.mempool_min_fee_sat_vb() {
-            Ok(fee) => fee,
+        let min_fee = match rpc.mempool_info() {
+            Ok(info) => info.min_fee_sat_vb,
             Err(e) => {
-                tracing::warn!(error = %e, "mempool_min_fee_sat_vb failed during bulk load");
+                tracing::warn!(error = %e, "mempool_info failed during bulk load");
                 sleep(poll_interval);
                 continue;
             }

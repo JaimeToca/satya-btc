@@ -14,7 +14,7 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|_| "info".into())).init();
 
     let cfg = config::Config::from_env()?;
-    let rpc = rpc::Rpc::connect(&cfg.rpc)?;
+    let mut rpc = rpc::Rpc::connect(&cfg.rpc)?;
     let network = rpc.network()?;
     let state: mempool::SharedState = Arc::new(RwLock::new(MempoolState::new(network)));
 

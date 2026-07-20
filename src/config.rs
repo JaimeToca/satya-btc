@@ -14,6 +14,7 @@ pub enum RpcAuth {
 pub struct RpcConfig {
     pub url: String,        // e.g. http://127.0.0.1:8332
     pub auth: RpcAuth,
+    pub timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +35,8 @@ struct Cli {
     rpc_user: Option<String>,
     #[arg(long, env = "BTC_RPC_PASS")]
     rpc_pass: Option<String>,
+    #[arg(long, env = "RPC_TIMEOUT_SECS", default_value_t = 30)]
+    rpc_timeout_secs: u64,
     #[arg(long, env = "HTTP_BIND", default_value = "127.0.0.1:8080")]
     http_bind: SocketAddr,
     #[arg(long, env = "POLL_INTERVAL_MS", default_value_t = 2000)]
@@ -49,7 +52,11 @@ impl Config {
             _ => anyhow::bail!("provide BTC_RPC_COOKIE_FILE or both BTC_RPC_USER and BTC_RPC_PASS"),
         };
         Ok(Config {
-            rpc: RpcConfig { url: cli.rpc_url, auth },
+            rpc: RpcConfig {
+                url: cli.rpc_url,
+                auth,
+                timeout: Duration::from_secs(cli.rpc_timeout_secs),
+            },
             http_bind: cli.http_bind,
             poll_interval: Duration::from_millis(cli.poll_interval_ms),
         })
