@@ -1,9 +1,16 @@
 [package]
-name = "hello-backend"
+name = "btc-indexer"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-axum = "0.8.9"
-serde_json = "1.0.151"
-tokio = { version = "1.53.0", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+axum = "0.7"
+bitcoincore-rpc = "0.19"
+bitcoin = "0.32"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
