@@ -34,10 +34,17 @@ pub struct Diff {
 }
 
 pub fn compute_diff(cache: &HashMap<Txid, MempoolTx>, node_txids: &HashSet<Txid>) -> Diff {
-    unimplemented!() // T4
+    let new = node_txids.iter().filter(|t| !cache.contains_key(*t)).copied().collect();
+    let gone = cache.keys().filter(|t| !node_txids.contains(*t)).copied().collect();
+    Diff { new, gone }
 }
 
 /// Insert freshly-fetched txs and remove departed ones.
 pub fn apply(state: &mut MempoolState, gone: &[Txid], fetched: Vec<(Txid, MempoolTx)>) {
-    unimplemented!() // T4
+    for txid in gone {
+        state.txs.remove(txid);
+    }
+    for (txid, tx) in fetched {
+        state.txs.insert(txid, tx);
+    }
 }
