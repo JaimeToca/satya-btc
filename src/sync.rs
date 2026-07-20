@@ -1,23 +1,18 @@
-use crate::mempool::{apply, compute_diff, SharedState};
+use crate::mempool::{compute_diff, read_state, write_state, SharedState};
 use crate::rpc::Rpc;
 use std::collections::HashSet;
 use std::thread::sleep;
-use std::time::Duration;
-
-/// If the node's mempool txid count drops below this fraction of our cached
-/// tx count (while the cache is large), treat it as a likely node restart /
-/// mempool flush rather than genuine mass eviction, and re-sync from scratch
-/// instead of blindly evicting everything we no longer see.
-const MASS_DROP_RATIO: f64 = 0.2;
+use std::time::{Duration, SystemTime};
 
 /// Cache size below which we don't bother applying the mass-drop guard —
-/// small mempools can legitimately shrink by more than `MASS_DROP_RATIO`
+/// small mempools can legitimately shrink by more than the mass-drop ratio
 /// during normal operation (e.g. a handful of txs all confirming at once).
 const MASS_DROP_MIN_CACHE_SIZE: usize = 100;
 
 /// Blocking loop; call on a dedicated std::thread. Never returns under normal operation.
 pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
-    // --- Startup: wait for the node's mempool to finish loading. ---
+    // --- Startup: wait for the node's mempool to finish loading, then do an
+    // initial full load before entering steady state. ---
     loop {
         match rpc.mempool_info() {
             Ok(info) if info.loaded => break,
@@ -31,64 +26,74 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
         sleep(poll_interval);
     }
 
-    // --- Initial bulk load. ---
-    bulk_load(&mut rpc, &state, poll_interval);
+    loop {
+        if bulk_resync(&mut rpc, &state) {
+            break;
+        }
+        tracing::warn!("initial bulk resync failed; retrying");
+        sleep(poll_interval);
+    }
 
     // --- Steady-state loop. ---
     loop {
         sleep(poll_interval);
 
+        let info = match rpc.mempool_info() {
+            Ok(info) => info,
+            Err(e) => {
+                tracing::warn!(error = %e, "mempool_info failed");
+                mark_stale(&state);
+                continue;
+            }
+        };
+
         let node_txids: HashSet<_> = match rpc.raw_mempool_txids() {
             Ok(txids) => txids.into_iter().collect(),
             Err(e) => {
                 tracing::warn!(error = %e, "raw_mempool_txids failed");
+                mark_stale(&state);
                 continue;
             }
         };
 
-        let loaded = match rpc.mempool_info() {
-            Ok(info) => info.loaded,
-            Err(e) => {
-                tracing::warn!(error = %e, "mempool_info check failed");
-                continue;
-            }
+        // Snapshot keys only — never clone tx values just to diff.
+        let (cache_len, cache_keys) = {
+            let g = read_state(&state);
+            (g.txs.len(), g.txs.keys().copied().collect::<HashSet<_>>())
         };
 
-        // Single read-lock snapshot: cache size/caught_up for the mass-drop
-        // check, and a clone of the cache for diffing — all taken together so
-        // we don't reacquire the lock (and risk it changing under us) between
-        // checks.
-        let (cache_len, was_caught_up, cache_snapshot) = match state.read() {
-            Ok(guard) => (guard.txs.len(), guard.caught_up, guard.txs.clone()),
-            Err(poisoned) => {
-                let guard = poisoned.into_inner();
-                (guard.txs.len(), guard.caught_up, guard.txs.clone())
-            }
-        };
+        let mass_drop = cache_len >= MASS_DROP_MIN_CACHE_SIZE
+            && node_txids.len().saturating_mul(5) < cache_len;
 
-        let mass_drop = was_caught_up
-            && cache_len >= MASS_DROP_MIN_CACHE_SIZE
-            && (node_txids.len() as f64) < (cache_len as f64) * MASS_DROP_RATIO;
-
-        if !loaded || mass_drop {
-            match state.write() {
-                Ok(mut guard) => guard.caught_up = false,
-                Err(poisoned) => poisoned.into_inner().caught_up = false,
-            }
+        if !info.loaded || mass_drop {
             tracing::warn!(
-                loaded,
+                loaded = info.loaded,
                 mass_drop,
                 node_txid_count = node_txids.len(),
                 cache_len,
-                "mempool desync detected (node reload or mass drop); skipping eviction this tick"
+                "mempool desync detected (node reload or mass drop); resyncing from scratch"
             );
+            if !bulk_resync(&mut rpc, &state) {
+                mark_stale(&state);
+            }
             continue;
         }
 
-        let diff = compute_diff(&cache_snapshot, &node_txids);
+        let diff = compute_diff(&cache_keys, &node_txids);
 
+        // Apply removals immediately: the node's txid list is authoritative,
+        // so departed txs shouldn't wait on the (possibly-failing) fetch of
+        // newly-seen ones below.
+        {
+            let mut g = write_state(&state);
+            for txid in &diff.gone {
+                g.txs.remove(txid);
+            }
+        }
+
+        // Fetch adds best-effort: a single failed fetch doesn't abort the
+        // batch or discard txs already fetched this tick.
         let mut fetched = Vec::with_capacity(diff.new.len());
-        let mut fetch_err = false;
         for txid in &diff.new {
             match rpc.mempool_entry(txid) {
                 Ok(Some(tx)) => fetched.push((*txid, tx)),
@@ -96,96 +101,70 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
                     // Vanished between listing and fetch; nothing to add.
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, %txid, "mempool_entry fetch failed");
-                    fetch_err = true;
-                    break;
+                    tracing::warn!(error = %e, %txid, "mempool_entry fetch failed; will retry next tick");
                 }
             }
         }
-        if fetch_err {
-            continue;
-        }
 
-        let min_fee = match rpc.mempool_info() {
-            Ok(info) => info.min_fee_sat_vb,
-            Err(e) => {
-                tracing::warn!(error = %e, "mempool_info failed");
-                continue;
-            }
-        };
-        let tip_height = match rpc.tip_height() {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::warn!(error = %e, "tip_height failed");
-                continue;
-            }
-        };
+        let tip_height = rpc.tip_height().ok();
 
-        match state.write() {
-            Ok(mut guard) => {
-                apply(&mut guard, &diff.gone, fetched);
-                guard.mempool_min_fee_sat_vb = min_fee;
-                guard.tip_height = tip_height;
-                guard.caught_up = true;
+        {
+            let mut g = write_state(&state);
+            for (txid, tx) in fetched {
+                g.txs.insert(txid, tx);
             }
-            Err(poisoned) => {
-                let mut guard = poisoned.into_inner();
-                apply(&mut guard, &diff.gone, fetched);
-                guard.mempool_min_fee_sat_vb = min_fee;
-                guard.tip_height = tip_height;
-                guard.caught_up = true;
+            g.mempool_min_fee_sat_vb = info.min_fee_sat_vb;
+            if let Some(h) = tip_height {
+                g.tip_height = h;
             }
+            g.caught_up = true;
+            g.last_sync_ok = Some(SystemTime::now());
         }
     }
 }
 
-/// Fetch the full mempool from the node and replace the in-memory cache wholesale.
-/// Retries indefinitely (on `poll_interval`) until it succeeds, since the caller
-/// depends on a fully-populated cache before entering steady state.
-fn bulk_load(rpc: &mut Rpc, state: &SharedState, poll_interval: Duration) {
-    loop {
-        let loaded = match rpc.raw_mempool_verbose() {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::warn!(error = %e, "raw_mempool_verbose failed during bulk load");
-                sleep(poll_interval);
-                continue;
-            }
-        };
-        let min_fee = match rpc.mempool_info() {
-            Ok(info) => info.min_fee_sat_vb,
-            Err(e) => {
-                tracing::warn!(error = %e, "mempool_info failed during bulk load");
-                sleep(poll_interval);
-                continue;
-            }
-        };
-        let tip_height = match rpc.tip_height() {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::warn!(error = %e, "tip_height failed during bulk load");
-                sleep(poll_interval);
-                continue;
-            }
-        };
-
-        let count = loaded.len();
-        match state.write() {
-            Ok(mut guard) => {
-                guard.txs = loaded.into_iter().collect();
-                guard.mempool_min_fee_sat_vb = min_fee;
-                guard.tip_height = tip_height;
-                guard.caught_up = true;
-            }
-            Err(poisoned) => {
-                let mut guard = poisoned.into_inner();
-                guard.txs = loaded.into_iter().collect();
-                guard.mempool_min_fee_sat_vb = min_fee;
-                guard.tip_height = tip_height;
-                guard.caught_up = true;
-            }
+/// Fetch the full mempool from the node and replace the in-memory cache
+/// wholesale. Returns `true` on success (state updated, `caught_up = true`,
+/// `last_sync_ok` refreshed) or `false` on failure (state left untouched by
+/// this call; caller decides how to mark staleness).
+fn bulk_resync(rpc: &mut Rpc, state: &SharedState) -> bool {
+    let entries = match rpc.raw_mempool_verbose() {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(error = %e, "raw_mempool_verbose failed during bulk resync");
+            return false;
         }
-        tracing::info!(count, "mempool bulk load complete");
-        return;
+    };
+    let info = match rpc.mempool_info() {
+        Ok(info) => info,
+        Err(e) => {
+            tracing::warn!(error = %e, "mempool_info failed during bulk resync");
+            return false;
+        }
+    };
+    let tip_height = match rpc.tip_height() {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "tip_height failed during bulk resync");
+            return false;
+        }
+    };
+
+    let count = entries.len();
+    {
+        let mut g = write_state(state);
+        g.txs = entries.into_iter().collect();
+        g.mempool_min_fee_sat_vb = info.min_fee_sat_vb;
+        g.tip_height = tip_height;
+        g.caught_up = true;
+        g.last_sync_ok = Some(SystemTime::now());
     }
+    tracing::info!(count, "mempool bulk resync complete");
+    true
+}
+
+/// Mark the cache stale (not caught up) after a failed poll. Does not touch
+/// `last_sync_ok`, which reflects the last time a sync actually succeeded.
+fn mark_stale(state: &SharedState) {
+    write_state(state).caught_up = false;
 }
