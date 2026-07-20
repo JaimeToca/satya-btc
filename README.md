@@ -118,6 +118,7 @@ work). Only the RPC connection is required; everything else has a default.
 | `BTC_RPC_PASS`          | one auth method\*   | —                       | RPC password (used with `BTC_RPC_USER`).          |
 | `HTTP_BIND`             | no                  | `127.0.0.1:8080`        | Address the HTTP server binds to.                |
 | `POLL_INTERVAL_MS`      | no                  | `2000`                  | Mempool poll interval, in milliseconds.          |
+| `RPC_TIMEOUT_SECS`      | no                  | `30`                    | Timeout for each Bitcoin Core RPC call, seconds. |
 
 \* **Authentication:** provide **either** `BTC_RPC_COOKIE_FILE` **or** both `BTC_RPC_USER`
 and `BTC_RPC_PASS`. If a cookie file is given it takes precedence; if neither is usable the
@@ -148,19 +149,21 @@ curl -s http://127.0.0.1:8080/health | jq
   "mempool_size": 152340,
   "tip_height": 850000,
   "mempool_min_fee_sat_vb": 1.0,
-  "network": "bitcoin"
+  "network": "bitcoin",
+  "last_sync_ok": 1721557200
 }
 ```
 
 ### `/health` fields
 
-| Field                    | Type    | Meaning                                                                 |
-|--------------------------|---------|-------------------------------------------------------------------------|
-| `caught_up`              | bool    | `false` until the first full sync completes; `false` again while guarded.|
-| `mempool_size`           | number  | Transactions currently held in the in-memory mempool.                   |
-| `tip_height`             | number  | The node's chain tip height as last seen.                               |
-| `mempool_min_fee_sat_vb` | number  | The node's current mempool min fee, in sat/vB (the eviction floor).     |
-| `network`                | string  | Network inferred from the node (`bitcoin`, `testnet`, `signet`, `regtest`).|
+| Field                    | Type          | Meaning                                                                 |
+|--------------------------|---------------|-------------------------------------------------------------------------|
+| `caught_up`              | bool          | `true` only after a recent successful sync; `false` before the first sync, while resyncing, or during any node/RPC outage. |
+| `mempool_size`           | number        | Transactions currently held in the in-memory mempool.                   |
+| `tip_height`             | number        | The node's chain tip height as last seen.                               |
+| `mempool_min_fee_sat_vb` | number        | The node's current mempool min fee, in sat/vB (the eviction floor).     |
+| `network`                | string        | Network inferred from the node (`bitcoin`, `testnet`, `signet`, `regtest`).|
+| `last_sync_ok`           | number \| null | Unix seconds of the last successful sync, or `null` if never synced — lets you tell "never synced" from "synced N seconds ago" even when `caught_up` is `false`. |
 
 Logging verbosity follows the standard `RUST_LOG` environment variable (defaults to `info`).
 
@@ -171,12 +174,14 @@ Logging verbosity follows the standard `RUST_LOG` environment variable (defaults
 - **`/fees` endpoint** — recommended fee tiers derived from those projected blocks, gated on
   `caught_up`.
 
-### Known follow-ups (tracked, deferred from Phase 1)
+### Hardening (Phase 1.1)
 
-- The sync thread is not currently supervised: if it were to panic, the process would keep
-  running and serve stale state. Add supervision/restart.
-- No RPC-call timeout is enforced yet (a hung node call would stall only the sync thread,
-  not `/health`); this returns when a timeout-capable transport is added.
+A staff code-review pass hardened the failure paths: `/health` now reports `caught_up: false`
+during node/RPC outages (it no longer over-claims readiness), RPC calls have a timeout and the
+client reconnects if the node's cookie rotates, a single failed transaction fetch no longer
+stalls the sync, and the sync thread is supervised (a panic exits the process for a supervisor
+to restart, rather than silently freezing). Remaining items (release profile, `lib.rs` split,
+minor allocation trims) are tracked for the test phase.
 
 ## License
 
