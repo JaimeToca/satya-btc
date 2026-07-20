@@ -4,9 +4,10 @@ use std::collections::HashSet;
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};
 
-/// Cache size below which we don't bother applying the mass-drop guard —
-/// small mempools can legitimately shrink by more than the mass-drop ratio
-/// during normal operation (e.g. a handful of txs all confirming at once).
+/// Cache size below which we skip the mass-drop resync check — small mempools
+/// can legitimately shrink by more than 80% during normal operation (e.g. a few
+/// txs all confirming in one block), which would otherwise trigger a needless
+/// full resync.
 const MASS_DROP_MIN_CACHE_SIZE: usize = 100;
 
 /// Blocking loop; call on a dedicated std::thread. Never returns under normal operation.
