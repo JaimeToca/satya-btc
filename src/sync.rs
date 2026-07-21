@@ -1,8 +1,56 @@
-use crate::mempool::{self, compute_diff, read_state, write_state, MempoolTx, SharedState};
+use crate::mempool::{self, compute_diff, read_state, write_state, MempoolState, MempoolTx, SharedState};
 use crate::rpc::Rpc;
 use std::collections::HashSet;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime};
+
+/// Maximum length of a formatted error string included in a log line, so a
+/// huge (or secret-bearing) provider error body can't blow up the logs.
+const MAX_ERR_LOG_LEN: usize = 200;
+
+/// Format an error and truncate it to `MAX_ERR_LOG_LEN` chars, so oversized
+/// error bodies (e.g. from a misbehaving RPC provider) don't get logged in
+/// full.
+fn short_err(e: &anyhow::Error) -> String {
+    let full = format!("{e}");
+    if full.chars().count() > MAX_ERR_LOG_LEN {
+        let mut s: String = full.chars().take(MAX_ERR_LOG_LEN).collect();
+        s.push('…');
+        s
+    } else {
+        full
+    }
+}
+
+/// Set `state.caught_up` (state-write semantics unchanged from the previous
+/// direct assignments) and, if this changes the value relative to `prev`, log
+/// the transition once. `prev` is updated to match. This turns what used to
+/// be scattered per-tick logging into a single operator-facing signal: a
+/// 10-minute outage now produces one "mempool out of sync" warn instead of
+/// one per tick.
+///
+/// `mempool_size` is only meaningful (and only logged) on a false->true
+/// transition; pass a value already in hand rather than taking a fresh lock
+/// just to read the cache length.
+fn set_synced_locked(g: &mut MempoolState, prev: &mut bool, synced: bool, reason: &str, mempool_size: usize) {
+    g.caught_up = synced;
+    if synced == *prev {
+        return;
+    }
+    if synced {
+        tracing::info!(mempool_size, "mempool in sync");
+    } else {
+        tracing::warn!(reason, "mempool out of sync");
+    }
+    *prev = synced;
+}
+
+/// Like `set_synced_locked`, but acquires the write lock itself. For call
+/// sites that aren't already inside a write-lock block.
+fn set_synced(state: &SharedState, prev: &mut bool, synced: bool, reason: &str, mempool_size: usize) {
+    let mut g = write_state(state);
+    set_synced_locked(&mut g, prev, synced, reason, mempool_size);
+}
 
 /// Cache size below which we skip the mass-drop resync check — small mempools
 /// can legitimately shrink by more than 80% during normal operation (e.g. a few
@@ -36,7 +84,7 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
                 tracing::info!("waiting for node mempool to finish loading");
             }
             Err(e) => {
-                tracing::warn!(error = %e, "error checking mempool_info during startup");
+                tracing::debug!(error = %short_err(&e), "error checking mempool_info during startup");
             }
         }
         sleep(poll_interval);
@@ -44,13 +92,21 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
 
     let mut last_bulk_resync: Option<Instant>;
     loop {
-        if bulk_resync(&mut rpc, &state) {
+        if let Some(count) = bulk_resync(&mut rpc, &state) {
             last_bulk_resync = Some(Instant::now());
+            tracing::info!(mempool_size = count, "mempool in sync");
             break;
         }
         tracing::warn!("initial bulk resync failed; retrying");
         sleep(poll_interval);
     }
+
+    // Tracks the previously-logged `caught_up` value so we only emit a
+    // transition log on the edge (see `set_synced`), not every tick. The
+    // initial bulk resync above set `caught_up = true` in state (and we just
+    // logged the corresponding "mempool in sync" line directly), so start
+    // this tracker in sync too.
+    let mut caught_up_prev = true;
 
     // --- Steady-state loop. ---
     loop {
@@ -59,8 +115,8 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
         let info = match rpc.mempool_info() {
             Ok(info) => info,
             Err(e) => {
-                tracing::warn!(error = %e, "mempool_info failed");
-                mark_stale(&state);
+                tracing::debug!(error = %short_err(&e), "mempool_info failed");
+                set_synced(&state, &mut caught_up_prev, false, "rpc_error:mempool_info", 0);
                 continue;
             }
         };
@@ -71,8 +127,8 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
         let node_txids: HashSet<_> = match rpc.raw_mempool_txids() {
             Ok(txids) => txids.into_iter().collect(),
             Err(e) => {
-                tracing::warn!(error = %e, "raw_mempool_txids failed");
-                mark_stale(&state);
+                tracing::debug!(error = %short_err(&e), "raw_mempool_txids failed");
+                set_synced(&state, &mut caught_up_prev, false, "rpc_error:raw_mempool_txids", 0);
                 continue;
             }
         };
@@ -87,20 +143,21 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
             && node_txids.len().saturating_mul(5) < cache_len;
 
         if !loaded || mass_drop {
+            let reason = if !loaded { "node_not_loaded" } else { "mass_drop" };
             let cooling_down = last_bulk_resync
                 .is_some_and(|t| t.elapsed() < RESYNC_COOLDOWN);
             if cooling_down {
-                tracing::warn!(
+                tracing::debug!(
                     loaded,
                     mass_drop,
                     node_txid_count = node_txids.len(),
                     cache_len,
                     "mempool desync detected but bulk resync is in cooldown; waiting it out"
                 );
-                mark_stale(&state);
+                set_synced(&state, &mut caught_up_prev, false, reason, 0);
                 continue;
             }
-            tracing::warn!(
+            tracing::debug!(
                 loaded,
                 mass_drop,
                 node_txid_count = node_txids.len(),
@@ -108,8 +165,12 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
                 "mempool desync detected (node reload or mass drop); resyncing from scratch"
             );
             last_bulk_resync = Some(Instant::now());
-            if !bulk_resync(&mut rpc, &state) {
-                mark_stale(&state);
+            match bulk_resync(&mut rpc, &state) {
+                Some(count) => {
+                    caught_up_prev = true;
+                    tracing::info!(mempool_size = count, "mempool in sync");
+                }
+                None => set_synced(&state, &mut caught_up_prev, false, "resync_failed", 0),
             }
             continue;
         }
@@ -141,7 +202,7 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
                 }
                 Err(e) => {
                     fetch_errors += 1;
-                    tracing::warn!(error = %e, %txid, "mempool_entry fetch failed; will retry next tick");
+                    tracing::debug!(error = %short_err(&e), %txid, "mempool_entry fetch failed; will retry next tick");
                 }
             }
         }
@@ -154,6 +215,19 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
         // cache is known to be behind the node, so `/health` should say so.
         let backlog = diff.new.len() > MAX_NEW_FETCH_PER_TICK || fetch_errors > 0;
 
+        tracing::debug!(
+            new = diff.new.len(),
+            gone = diff.gone.len(),
+            fetched = fetched.len(),
+            backlog,
+            "sync tick"
+        );
+
+        // Cache size after this tick's removals/inserts, computed from
+        // counts already in hand rather than re-reading the cache under lock
+        // just for a log field.
+        let mempool_size = cache_len - diff.gone.len() + fetched.len();
+
         {
             let mut g = write_state(&state);
             for (txid, tx) in fetched {
@@ -164,9 +238,9 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
                 g.tip_height = h;
             }
             if backlog {
-                g.caught_up = false;
+                set_synced_locked(&mut g, &mut caught_up_prev, false, "backlog", 0);
             } else {
-                g.caught_up = true;
+                set_synced_locked(&mut g, &mut caught_up_prev, true, "", mempool_size);
                 g.last_sync_ok = Some(SystemTime::now());
             }
         }
@@ -174,29 +248,30 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
 }
 
 /// Fetch the full mempool from the node and replace the in-memory cache
-/// wholesale. Returns `true` on success (state updated, `caught_up = true`,
-/// `last_sync_ok` refreshed) or `false` on failure (state left untouched by
-/// this call; caller decides how to mark staleness).
-fn bulk_resync(rpc: &mut Rpc, state: &SharedState) -> bool {
+/// wholesale. Returns `Some(count)` on success (state updated, `caught_up =
+/// true`, `last_sync_ok` refreshed), where `count` is the number of txs
+/// loaded, or `None` on failure (state left untouched by this call; caller
+/// decides how to mark staleness).
+fn bulk_resync(rpc: &mut Rpc, state: &SharedState) -> Option<usize> {
     let entries = match rpc.raw_mempool_verbose() {
         Ok(entries) => entries,
         Err(e) => {
-            tracing::warn!(error = %e, "raw_mempool_verbose failed during bulk resync");
-            return false;
+            tracing::debug!(error = %short_err(&e), "raw_mempool_verbose failed during bulk resync");
+            return None;
         }
     };
     let info = match rpc.mempool_info() {
         Ok(info) => info,
         Err(e) => {
-            tracing::warn!(error = %e, "mempool_info failed during bulk resync");
-            return false;
+            tracing::debug!(error = %short_err(&e), "mempool_info failed during bulk resync");
+            return None;
         }
     };
     let tip_height = match rpc.tip_height() {
         Ok(h) => h,
         Err(e) => {
-            tracing::warn!(error = %e, "tip_height failed during bulk resync");
-            return false;
+            tracing::debug!(error = %short_err(&e), "tip_height failed during bulk resync");
+            return None;
         }
     };
 
@@ -213,11 +288,5 @@ fn bulk_resync(rpc: &mut Rpc, state: &SharedState) -> bool {
         g.last_sync_ok = Some(SystemTime::now());
     }
     tracing::info!(count, "mempool bulk resync complete");
-    true
-}
-
-/// Mark the cache stale (not caught up) after a failed poll. Does not touch
-/// `last_sync_ok`, which reflects the last time a sync actually succeeded.
-fn mark_stale(state: &SharedState) {
-    write_state(state).caught_up = false;
+    Some(count)
 }
