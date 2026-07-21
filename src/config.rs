@@ -34,6 +34,15 @@ pub struct Config {
     /// How often to emit a steady-state liveness "heartbeat" log at INFO, even
     /// when nothing changed. `Duration::ZERO` disables the heartbeat.
     pub heartbeat: Duration,
+    /// Max concurrent getmempoolentry calls per tick. Bounded by node
+    /// rpcthreads (default 4) / rpcworkqueue (default 16).
+    pub fetch_concurrency: usize,
+    /// Node zmqpubhashblock endpoint (e.g. tcp://127.0.0.1:28332) for
+    /// immediate recompute on new blocks. Unset = polling only.
+    pub zmq_block: Option<String>,
+    /// Max fetch time per tick before bailing and marking stale. Default:
+    /// 2 x POLL_INTERVAL_MS.
+    pub tick_budget: Duration,
 }
 
 #[derive(Parser)]
@@ -69,6 +78,18 @@ struct Cli {
     /// Seconds between steady-state liveness heartbeat logs. `0` disables it.
     #[arg(long, env = "HEARTBEAT_SECS", default_value_t = 30)]
     heartbeat_secs: u64,
+    /// Max concurrent getmempoolentry calls per tick. Bounded by node
+    /// rpcthreads (default 4) / rpcworkqueue (default 16).
+    #[arg(long, env = "FETCH_CONCURRENCY", default_value_t = 10)]
+    fetch_concurrency: usize,
+    /// Node zmqpubhashblock endpoint (e.g. tcp://127.0.0.1:28332) for
+    /// immediate recompute on new blocks. Unset = polling only.
+    #[arg(long, env = "BTC_ZMQ_BLOCK")]
+    zmq_block: Option<String>,
+    /// Max fetch time per tick before bailing and marking stale. Default:
+    /// 2 x POLL_INTERVAL_MS.
+    #[arg(long, env = "TICK_BUDGET_MS")]
+    tick_budget_ms: Option<u64>,
 }
 
 impl Config {
@@ -97,6 +118,12 @@ impl Config {
             poll_interval: Duration::from_millis(cli.poll_interval_ms),
             sync_log_verbose: cli.sync_log_verbose,
             heartbeat: Duration::from_secs(cli.heartbeat_secs),
+            fetch_concurrency: cli.fetch_concurrency.max(1),
+            zmq_block: cli.zmq_block,
+            tick_budget: Duration::from_millis(
+                cli.tick_budget_ms
+                    .unwrap_or(cli.poll_interval_ms.saturating_mul(2)),
+            ),
         })
     }
 }
