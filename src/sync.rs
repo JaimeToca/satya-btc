@@ -1,9 +1,8 @@
 use crate::mempool::{
     self, compute_diff, read_state, write_state, MempoolState, MempoolTx, SharedState,
 };
-use crate::rpc::Rpc;
+use crate::rpc::{self, Rpc};
 use std::collections::HashSet;
-use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime};
 
 /// Maximum length of a formatted error string included in a log line, so a
@@ -95,6 +94,12 @@ pub struct SyncConfig {
     pub verbose: bool,
     /// Interval between steady-state liveness heartbeats. `ZERO` disables them.
     pub heartbeat: Duration,
+    /// Max concurrent `getmempoolentry` calls per tick. Consumed in Task 4
+    /// (concurrent fetch); the loop is still sequential for now.
+    pub fetch_concurrency: usize,
+    /// Max fetch time per tick before bailing and marking stale. Consumed in
+    /// Task 4; unused by the current sequential loop.
+    pub tick_budget: Duration,
 }
 
 /// Emit a liveness heartbeat at INFO if `interval` has elapsed since `last`,
@@ -115,13 +120,20 @@ fn maybe_heartbeat(state: &SharedState, last: &mut Instant, interval: Duration) 
     );
 }
 
-/// Blocking loop; call on a dedicated std::thread. Never returns under normal operation.
-pub fn run(mut rpc: Rpc, state: SharedState, cfg: SyncConfig) {
+/// Async sync loop; spawn on the tokio runtime. Never returns under normal
+/// operation. `wake_rx` lets a future ZMQ block event (Task 5) trigger an
+/// immediate steady-state tick instead of waiting out the poll interval.
+pub async fn run(
+    mut rpc: Rpc,
+    state: SharedState,
+    cfg: SyncConfig,
+    mut wake_rx: tokio::sync::mpsc::Receiver<()>,
+) {
     let poll_interval = cfg.poll_interval;
     // --- Startup: wait for the node's mempool to finish loading, then do an
     // initial full load before entering steady state. ---
     loop {
-        match rpc.mempool_info() {
+        match rpc.mempool_info().await {
             // Older nodes don't report `loaded` at all; treat that as loaded.
             Ok(info) if info.loaded.unwrap_or(true) => break,
             Ok(_) => {
@@ -131,7 +143,7 @@ pub fn run(mut rpc: Rpc, state: SharedState, cfg: SyncConfig) {
                 tracing::debug!(error = %short_err(&e), "error checking mempool_info during startup");
             }
         }
-        sleep(poll_interval);
+        tokio::time::sleep(poll_interval).await;
     }
 
     // Tracks the previously-logged `caught_up` value so we only emit a
@@ -142,28 +154,38 @@ pub fn run(mut rpc: Rpc, state: SharedState, cfg: SyncConfig) {
 
     let mut last_bulk_resync: Option<Instant>;
     loop {
-        if let Some(count) = bulk_resync(&mut rpc, &state) {
+        if let Some(count) = bulk_resync(&mut rpc, &state).await {
             last_bulk_resync = Some(Instant::now());
             set_synced(&state, &mut caught_up_prev, true, "", count);
             break;
         }
         tracing::warn!("initial bulk resync failed; retrying");
-        sleep(poll_interval);
+        tokio::time::sleep(poll_interval).await;
     }
 
     // --- Steady-state loop. ---
     let mut last_heartbeat = Instant::now();
     loop {
-        sleep(poll_interval);
+        // Interruptible wait: either the poll interval elapses, or a ZMQ block
+        // event wakes us early (wire-up in Task 5).
+        tokio::select! {
+            _ = tokio::time::sleep(poll_interval) => {}
+            _ = wake_rx.recv() => {}
+        }
         // Checked up front so the heartbeat still fires on ticks that `continue`
         // early (RPC errors, desync cooldown) — i.e. exactly when liveness is
         // most in doubt.
         maybe_heartbeat(&state, &mut last_heartbeat, cfg.heartbeat);
 
-        let info = match rpc.mempool_info() {
+        let info = match rpc.mempool_info().await {
             Ok(info) => info,
             Err(e) => {
                 tracing::debug!(error = %short_err(&e), "mempool_info failed");
+                if rpc::is_reconnectable(&e) {
+                    if let Err(re) = rpc.reconnect() {
+                        tracing::warn!(error = %short_err(&re), "rpc reconnect failed");
+                    }
+                }
                 set_synced(
                     &state,
                     &mut caught_up_prev,
@@ -178,10 +200,15 @@ pub fn run(mut rpc: Rpc, state: SharedState, cfg: SyncConfig) {
         let loaded = info.loaded.unwrap_or(true);
         let min_fee_sat_vb = mempool::min_fee_sat_vb(&info);
 
-        let node_txids: HashSet<_> = match rpc.raw_mempool_txids() {
+        let node_txids: HashSet<_> = match rpc.raw_mempool_txids().await {
             Ok(txids) => txids.into_iter().collect(),
             Err(e) => {
                 tracing::debug!(error = %short_err(&e), "raw_mempool_txids failed");
+                if rpc::is_reconnectable(&e) {
+                    if let Err(re) = rpc.reconnect() {
+                        tracing::warn!(error = %short_err(&re), "rpc reconnect failed");
+                    }
+                }
                 set_synced(
                     &state,
                     &mut caught_up_prev,
@@ -228,7 +255,7 @@ pub fn run(mut rpc: Rpc, state: SharedState, cfg: SyncConfig) {
                 "mempool desync detected (node reload or mass drop); resyncing from scratch"
             );
             last_bulk_resync = Some(Instant::now());
-            match bulk_resync(&mut rpc, &state) {
+            match bulk_resync(&mut rpc, &state).await {
                 Some(count) => set_synced(&state, &mut caught_up_prev, true, "", count),
                 None => set_synced(&state, &mut caught_up_prev, false, "resync_failed", 0),
             }
@@ -271,6 +298,7 @@ pub fn run(mut rpc: Rpc, state: SharedState, cfg: SyncConfig) {
             }
             match rpc
                 .mempool_entry(txid)
+                .await
                 .map(|opt| opt.map(|e| MempoolTx::from(&e)))
             {
                 Ok(Some(tx)) => fetched.push((*txid, tx)),
@@ -284,7 +312,7 @@ pub fn run(mut rpc: Rpc, state: SharedState, cfg: SyncConfig) {
             }
         }
 
-        let tip_height = rpc.tip_height().ok();
+        let tip_height = rpc.tip_height().await.ok();
 
         // Only promote to "caught up" when this tick fully resolved the
         // node's new-txid list (didn't hit the per-tick cap, and every fetch
@@ -346,22 +374,22 @@ pub fn run(mut rpc: Rpc, state: SharedState, cfg: SyncConfig) {
 /// true`, `last_sync_ok` refreshed), where `count` is the number of txs
 /// loaded, or `None` on failure (state left untouched by this call; caller
 /// decides how to mark staleness).
-fn bulk_resync(rpc: &mut Rpc, state: &SharedState) -> Option<usize> {
-    let entries = match rpc.raw_mempool_verbose() {
+async fn bulk_resync(rpc: &mut Rpc, state: &SharedState) -> Option<usize> {
+    let entries = match rpc.raw_mempool_verbose().await {
         Ok(entries) => entries,
         Err(e) => {
             tracing::debug!(error = %short_err(&e), "raw_mempool_verbose failed during bulk resync");
             return None;
         }
     };
-    let info = match rpc.mempool_info() {
+    let info = match rpc.mempool_info().await {
         Ok(info) => info,
         Err(e) => {
             tracing::debug!(error = %short_err(&e), "mempool_info failed during bulk resync");
             return None;
         }
     };
-    let tip_height = match rpc.tip_height() {
+    let tip_height = match rpc.tip_height().await {
         Ok(h) => h,
         Err(e) => {
             tracing::debug!(error = %short_err(&e), "tip_height failed during bulk resync");

@@ -17,26 +17,35 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = config::Config::from_env()?;
-    let mut rpc = rpc::Rpc::connect(&cfg.rpc)?;
-    let network = rpc.network()?;
+    let rpc = rpc::Rpc::connect(&cfg.rpc)?;
+    let network = rpc.network().await?;
     let state: mempool::SharedState = Arc::new(RwLock::new(MempoolState::new(network)));
 
-    // Sync loop on its own OS thread (blocking RPC client).
+    // Channel for a future ZMQ block listener (Task 5) to wake the sync loop
+    // for an immediate tick. `wake_tx` is unused this task but must stay alive:
+    // if it were dropped, `wake_rx.recv()` would resolve immediately on a
+    // closed channel and spin the steady-state loop.
+    let (wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let _wake_tx = wake_tx;
+
+    // Sync loop as a tokio task (blocking RPC calls run via spawn_blocking).
     let sync_state = state.clone();
     let sync_cfg = sync::SyncConfig {
         poll_interval: cfg.poll_interval,
         verbose: cfg.sync_log_verbose,
         heartbeat: cfg.heartbeat,
+        fetch_concurrency: cfg.fetch_concurrency,
+        tick_budget: cfg.tick_budget,
     };
-    let sync_handle = std::thread::spawn(move || sync::run(rpc, sync_state, sync_cfg));
+    let sync_handle = tokio::spawn(sync::run(rpc, sync_state, sync_cfg, wake_rx));
 
     // sync::run only returns via panic (it's an infinite loop). Supervise the
-    // thread off-runtime: if it ever ends, the process is silently frozen but
-    // still reporting `/health`, which is worse than a clean exit. Log and
-    // terminate so a process supervisor (systemd/docker) restarts us.
+    // task: if it ever ends, the process is silently frozen but still reporting
+    // `/health`, which is worse than a clean exit. Log and terminate so a
+    // process supervisor (systemd/docker) restarts us.
     tokio::spawn(async move {
-        let _ = tokio::task::spawn_blocking(move || sync_handle.join()).await;
-        tracing::error!("sync thread exited unexpectedly; shutting down");
+        let _ = sync_handle.await;
+        tracing::error!("sync task exited unexpectedly; shutting down");
         std::process::exit(1);
     });
 
