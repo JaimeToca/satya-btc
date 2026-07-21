@@ -40,12 +40,14 @@ pub struct Rpc {
     cfg: RpcConfig,
 }
 
-/// Errors from an RPC call. `Http`/`Decode` come `From` reqwest/serde_json so
-/// `call` can use `?`; `Auth` and `Rpc` are surfaced explicitly.
+/// Errors from an RPC call. `Decode` comes `From` serde_json so `call` can use
+/// `?`; `Http`, `Auth`, and `Rpc` are surfaced explicitly. `Http` is built via
+/// `reqwest::Error::without_url()` so a path-embedded provider token (e.g.
+/// `https://host/<KEY>`, which reqwest does NOT redact) never reaches the logs.
 #[derive(thiserror::Error, Debug)]
 pub enum RpcError {
     #[error("http transport error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(reqwest::Error),
     /// HTTP 401/403 — e.g. a rotated cookie. Reconnectable.
     #[error("rpc authentication failed")]
     Auth,
@@ -73,7 +75,8 @@ pub struct MempoolInfo {
     /// Present on nodes that report load progress; absent on older nodes.
     pub loaded: Option<bool>,
     /// Minimum mempool-acceptance fee rate, denominated by Core in BTC/kvB.
-    /// Parsed to exact integer sats via `as_btc` (no float rounding).
+    /// Parsed via `as_btc` to integer sats — exact for every real sat value
+    /// (≤ 21M BTC fits f64's mantissa); identical to the prior bitcoincore-rpc path.
     #[serde(with = "bitcoin::amount::serde::as_btc")]
     pub mempoolminfee: Amount,
 }
@@ -90,7 +93,7 @@ pub struct MempoolEntry {
 }
 
 /// The `fees` sub-object of a mempool entry. Core reports each as BTC decimals;
-/// `as_btc` parses to exact integer sats.
+/// `as_btc` parses BTC decimals to integer sats (exact; same as the old path).
 #[derive(Deserialize)]
 pub struct MempoolEntryFees {
     #[serde(with = "bitcoin::amount::serde::as_btc")]
@@ -156,7 +159,10 @@ impl Rpc {
             req = req.header(name, value);
         }
 
-        let resp = req.send().await?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| RpcError::Http(e.without_url()))?;
         let status = resp.status();
         // Auth failures never carry a useful JSON-RPC body; classify by status.
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -168,7 +174,10 @@ impl Rpc {
         // BODY — so we must parse the `{result, error}` envelope regardless of
         // the HTTP status, and only treat the status as the error when the body
         // isn't a parseable envelope (a genuine gateway/transport failure).
-        let bytes = resp.bytes().await?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| RpcError::Http(e.without_url()))?;
         match serde_json::from_slice::<RpcResponse>(&bytes) {
             Ok(parsed) => {
                 if let Some(err) = parsed.error {
