@@ -119,6 +119,7 @@ work). Only the RPC connection is required; everything else has a default.
 | `HTTP_BIND`             | no                  | `127.0.0.1:8080`        | Address the HTTP server binds to.                |
 | `POLL_INTERVAL_MS`      | no                  | `2000`                  | Mempool poll interval, in milliseconds.          |
 | `RPC_TIMEOUT_SECS`      | no                  | `30`                    | Timeout for each Bitcoin Core RPC call, seconds. |
+| `BTC_RPC_HEADERS`       | no                  | —                       | Extra request headers, `Name: Value`, comma-separated (or repeat `--rpc-header`). For providers using API-key headers. |
 
 \* **Authentication:** provide `BTC_RPC_COOKIE_FILE`, **or** both `BTC_RPC_USER` and
 `BTC_RPC_PASS`, **or neither** — omit auth when the endpoint carries its credential in the URL
@@ -126,6 +127,12 @@ work). Only the RPC connection is required; everything else has a default.
 precedence when set; it's the usual choice for a local node (Bitcoin Core writes it to its data
 directory, e.g. `~/.bitcoin/.cookie` on mainnet). `BTC_RPC_URL` may be `http://` (local node) or
 `https://` (hosted provider).
+
+For providers that authenticate with an **API-key header**, set `BTC_RPC_HEADERS` (additive with
+any auth mode, or none): `BTC_RPC_HEADERS="X-Api-Key: your_key"`. Multiple headers are
+comma-separated, or repeat the `--rpc-header "Name: Value"` flag. Note: because the env var is
+comma-separated, avoid header *values* that contain a comma (use repeated `--rpc-header` flags
+instead) — fine for typical API keys.
 
 ## Running
 
