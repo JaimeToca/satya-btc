@@ -105,9 +105,15 @@ fn is_reconnectable(err: &anyhow::Error) -> bool {
 }
 
 /// Build a Bitcoin Core RPC client through a timeout-capable transport.
+///
+/// Uses the `jsonrpc` crate's `minreq_http` transport rather than `simple_http`, since
+/// `simple_http` only speaks plain HTTP over raw TCP. `minreq_http` is backed by `minreq`
+/// (with rustls-based HTTPS support enabled via the `minreq/https` feature), so it works for
+/// both `http://` and `https://` RPC URLs -- needed for HTTPS providers such as GetBlock,
+/// whose auth token lives in the URL path rather than in basic auth.
 fn build_client(cfg: &RpcConfig) -> anyhow::Result<Client> {
-    let (user, pass) = match &cfg.auth {
-        RpcAuth::Cookie(path) => {
+    let user_pass = match &cfg.auth {
+        Some(RpcAuth::Cookie(path)) => {
             let contents = fs::read_to_string(path)?;
             let line = contents.lines().next().ok_or_else(|| {
                 anyhow::anyhow!("cookie file {} is empty", path.display())
@@ -115,16 +121,21 @@ fn build_client(cfg: &RpcConfig) -> anyhow::Result<Client> {
             let colon = line
                 .find(':')
                 .ok_or_else(|| anyhow::anyhow!("cookie file {} is malformed", path.display()))?;
-            (line[..colon].to_string(), line[colon + 1..].to_string())
+            Some((line[..colon].to_string(), line[colon + 1..].to_string()))
         }
-        RpcAuth::UserPass(user, pass) => (user.clone(), pass.clone()),
+        Some(RpcAuth::UserPass(user, pass)) => Some((user.clone(), pass.clone())),
+        // No cookie/user/pass configured: assume the URL itself carries the credential
+        // (e.g. a provider API key in the path), so skip basic auth entirely.
+        None => None,
     };
 
-    let transport = jsonrpc::simple_http::Builder::new()
+    let mut builder = jsonrpc::minreq_http::Builder::new()
         .url(&cfg.url)?
-        .auth(user, Some(pass))
-        .timeout(cfg.timeout)
-        .build();
+        .timeout(cfg.timeout);
+    if let Some((user, pass)) = user_pass {
+        builder = builder.basic_auth(user, Some(pass));
+    }
+    let transport = builder.build();
     let jsonrpc_client = jsonrpc::client::Client::with_transport(transport);
     Ok(Client::from_jsonrpc(jsonrpc_client))
 }

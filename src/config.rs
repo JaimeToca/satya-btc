@@ -12,8 +12,10 @@ pub enum RpcAuth {
 
 #[derive(Debug, Clone)]
 pub struct RpcConfig {
-    pub url: String,        // e.g. http://127.0.0.1:8332
-    pub auth: RpcAuth,
+    pub url: String, // e.g. http://127.0.0.1:8332 or an HTTPS provider URL
+    /// `None` when the URL itself carries the credential (e.g. a provider API key in the
+    /// path, like `https://go.getblock.io/<KEY>`), so no separate basic auth is needed.
+    pub auth: Option<RpcAuth>,
     pub timeout: Duration,
 }
 
@@ -47,9 +49,11 @@ impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         let cli = Cli::parse();
         let auth = match (cli.rpc_cookie_file, cli.rpc_user, cli.rpc_pass) {
-            (Some(path), _, _) => RpcAuth::Cookie(path),
-            (None, Some(u), Some(p)) => RpcAuth::UserPass(u, p),
-            _ => anyhow::bail!("provide BTC_RPC_COOKIE_FILE or both BTC_RPC_USER and BTC_RPC_PASS"),
+            (Some(path), _, _) => Some(RpcAuth::Cookie(path)),
+            (None, Some(u), Some(p)) => Some(RpcAuth::UserPass(u, p)),
+            // Neither cookie nor user/pass provided: assume the RPC URL itself carries the
+            // credential (e.g. a provider API key embedded in the path), so no basic auth.
+            _ => None,
         };
         Ok(Config {
             rpc: RpcConfig {
