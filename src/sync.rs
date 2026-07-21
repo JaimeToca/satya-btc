@@ -2,6 +2,8 @@ use crate::mempool::{
     self, compute_diff, read_state, write_state, MempoolState, MempoolTx, SharedState,
 };
 use crate::rpc::{self, Rpc};
+use bitcoincore_rpc::bitcoin::Txid;
+use futures::stream::{self, StreamExt};
 use std::collections::HashSet;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -274,34 +276,36 @@ pub async fn run(
             }
         }
 
-        // Fetch adds best-effort and bounded: a single failed fetch doesn't
-        // abort the batch or discard txs already fetched this tick, and we
-        // only fetch up to MAX_NEW_FETCH_PER_TICK per tick. Anything left
-        // over stays absent from the cache, so it's still in `diff.new` (and
-        // gets fetched) next tick — nothing is permanently lost.
-        let to_fetch = diff.new.len().min(MAX_NEW_FETCH_PER_TICK);
+        // Fetch adds best-effort, bounded, and concurrent: a single failed
+        // fetch doesn't abort the batch or discard txs already fetched this
+        // tick; we fetch up to MAX_NEW_FETCH_PER_TICK per tick with at most
+        // `cfg.fetch_concurrency` calls in flight (via `buffer_unordered`); and
+        // we stop consuming once this tick's fetch has run past `cfg.tick_budget`.
+        // Anything left over (capped, dropped in-flight on budget bail, or
+        // errored) stays absent from the cache, so it's still in `diff.new`
+        // (and gets fetched) next tick — nothing is permanently lost.
+        let candidates: Vec<Txid> = diff.new.iter().take(MAX_NEW_FETCH_PER_TICK).copied().collect();
+        let to_fetch = candidates.len();
+        let fetch_start = Instant::now();
+        let mut budget_exceeded = false;
         let mut fetched = Vec::with_capacity(to_fetch);
         let mut fetch_errors = 0usize;
-        for txid in diff.new.iter().take(MAX_NEW_FETCH_PER_TICK) {
-            // Against a high-latency provider a single tick's sequential fetch
-            // can run for many seconds; emit a throttled progress line (same
-            // cadence as the heartbeat) so a long tick still shows liveness
-            // instead of going dark. Resets `last_heartbeat` so the top-of-loop
-            // heartbeat keeps one steady cadence.
-            if !cfg.heartbeat.is_zero() && last_heartbeat.elapsed() >= cfg.heartbeat {
-                last_heartbeat = Instant::now();
-                tracing::info!(
-                    fetched = fetched.len(),
-                    to_fetch,
-                    "sync in progress (fetching new mempool entries)"
-                );
-            }
-            match rpc
-                .mempool_entry(txid)
-                .await
-                .map(|opt| opt.map(|e| MempoolTx::from(&e)))
-            {
-                Ok(Some(tx)) => fetched.push((*txid, tx)),
+        let mut results = stream::iter(candidates.into_iter())
+            .map(|txid| {
+                let rpc = rpc.clone();
+                async move {
+                    (
+                        txid,
+                        rpc.mempool_entry(&txid)
+                            .await
+                            .map(|opt| opt.map(|e| MempoolTx::from(&e))),
+                    )
+                }
+            })
+            .buffer_unordered(cfg.fetch_concurrency);
+        while let Some((txid, res)) = results.next().await {
+            match res {
+                Ok(Some(tx)) => fetched.push((txid, tx)),
                 Ok(None) => {
                     // Vanished between listing and fetch; nothing to add.
                 }
@@ -310,15 +314,37 @@ pub async fn run(
                     tracing::debug!(error = %short_err(&e), %txid, "mempool_entry fetch failed; will retry next tick");
                 }
             }
+            // Time-based bail: stop consuming once this tick's fetch has run
+            // past budget. In-flight futures are dropped when we `break`; their
+            // txids reappear in next tick's `diff.new`.
+            if fetch_start.elapsed() > cfg.tick_budget {
+                budget_exceeded = true;
+                break;
+            }
+            // Against a high-latency provider a single tick's fetch can run for
+            // many seconds; emit a throttled progress line (same cadence as the
+            // heartbeat) so a long tick still shows liveness instead of going
+            // dark. Resets `last_heartbeat` so the top-of-loop heartbeat keeps
+            // one steady cadence.
+            if !cfg.heartbeat.is_zero() && last_heartbeat.elapsed() >= cfg.heartbeat {
+                last_heartbeat = Instant::now();
+                tracing::info!(
+                    fetched = fetched.len(),
+                    to_fetch,
+                    "sync in progress (fetching new mempool entries)"
+                );
+            }
         }
 
         let tip_height = rpc.tip_height().await.ok();
 
         // Only promote to "caught up" when this tick fully resolved the
-        // node's new-txid list (didn't hit the per-tick cap, and every fetch
-        // either succeeded or the tx had already vanished). Otherwise the
-        // cache is known to be behind the node, so `/health` should say so.
-        let backlog = diff.new.len() > MAX_NEW_FETCH_PER_TICK || fetch_errors > 0;
+        // node's new-txid list (didn't hit the per-tick cap, didn't bail on
+        // the time budget, and every fetch either succeeded or the tx had
+        // already vanished). Otherwise the cache is known to be behind the
+        // node, so `/health` should say so.
+        let backlog =
+            diff.new.len() > MAX_NEW_FETCH_PER_TICK || fetch_errors > 0 || budget_exceeded;
 
         // Cache size after this tick's removals/inserts, computed from
         // counts already in hand rather than re-reading the cache under lock
@@ -336,6 +362,7 @@ pub async fn run(
                 mempool_size,
                 tip_height = ?tip_height,
                 backlog,
+                budget_exceeded,
                 "sync tick"
             );
         } else {
@@ -346,6 +373,7 @@ pub async fn run(
                 mempool_size,
                 tip_height = ?tip_height,
                 backlog,
+                budget_exceeded,
                 "sync tick"
             );
         }
