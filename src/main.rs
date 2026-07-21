@@ -1,5 +1,6 @@
 mod config;
 mod rpc;
+mod transport;
 mod mempool;
 mod sync;
 mod http;
