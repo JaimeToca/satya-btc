@@ -12,6 +12,9 @@ bitcoin = "0.32"
 # minreq's `https` feature. Depending on minreq directly here unifies that feature across the
 # build so the shared jsonrpc/minreq instance gains HTTPS (rustls) support.
 minreq = { version = "2.14", features = ["https"] }
+# Same base64 version `jsonrpc` uses internally for its own basic-auth header encoding; pinned
+# here directly since our custom RPC transport (src/rpc.rs) builds that header itself.
+base64 = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
