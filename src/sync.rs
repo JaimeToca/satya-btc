@@ -1,24 +1,22 @@
 use crate::mempool::{
     self, compute_diff, read_state, write_state, MempoolState, MempoolTx, SharedState,
 };
-use crate::rpc::{self, Rpc};
-use bitcoincore_rpc::bitcoin::Txid;
+use crate::rpc::{self, Rpc, RpcError};
+use bitcoin::Txid;
 use futures::stream::{self, StreamExt};
 use futures::FutureExt;
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::Semaphore;
 
 /// Maximum length of a formatted error string included in a log line, so a
 /// huge (or secret-bearing) provider error body can't blow up the logs.
 const MAX_ERR_LOG_LEN: usize = 200;
 
-/// Format an error (including its full `anyhow` source/cause chain, via the
-/// alternate `{:#}` form) and truncate it to `MAX_ERR_LOG_LEN` chars in a
-/// single pass, so oversized error bodies (e.g. from a misbehaving RPC
-/// provider) don't get logged in full.
-fn short_err(e: &anyhow::Error) -> String {
+/// Format an error (for `anyhow::Error`, the alternate `{:#}` form includes the
+/// full source/cause chain; for other `Display` types it's just their message)
+/// and truncate it to `MAX_ERR_LOG_LEN` chars in a single pass, so oversized
+/// error bodies (e.g. from a misbehaving RPC provider) don't get logged in full.
+fn short_err<E: std::fmt::Display>(e: &E) -> String {
     let full = format!("{e:#}");
     let mut chars = full.chars();
     let mut s: String = chars.by_ref().take(MAX_ERR_LOG_LEN).collect();
@@ -153,14 +151,10 @@ pub async fn run(
     }
 
     // --- Steady-state loop. ---
-    // Shared across ALL ticks: caps concurrent in-flight blocking
-    // `getmempoolentry` calls at `fetch_concurrency` globally, not just per
-    // tick. Each fetch acquires an owned permit that's moved into its
-    // `spawn_blocking` closure and released only when that blocking RPC
-    // completes — so work orphaned by a budget-bail `break` (whose futures are
-    // dropped) still holds its permit until the underlying RPC finishes,
-    // protecting bitcoind's `rpcworkqueue` from a pile-up across ticks.
-    let fetch_semaphore = Arc::new(Semaphore::new(cfg.fetch_concurrency));
+    // Per-tick fetch concurrency is bounded by `buffer_unordered` below. Because
+    // the RPC is now async over reqwest, dropping the fetch stream on a
+    // budget-bail truly cancels in-flight requests (no orphaned work), so no
+    // cross-tick semaphore is needed to protect bitcoind's `rpcworkqueue`.
     loop {
         // Interruptible wait: either the poll interval elapses, or a ZMQ block
         // event wakes us early (wire-up in Task 5).
@@ -290,7 +284,7 @@ pub async fn run(
         // budget-bail drain below so the Ok(Some)/Ok(None)/Err handling can't
         // drift between the two.
         let process = |txid: Txid,
-                           res: anyhow::Result<Option<MempoolTx>>,
+                           res: Result<Option<MempoolTx>, RpcError>,
                            fetched: &mut Vec<(Txid, MempoolTx)>,
                            fetch_errors: &mut usize,
                            resolved: &mut usize| {
@@ -309,23 +303,10 @@ pub async fn run(
         let mut results = stream::iter(candidates.into_iter())
             .map(|txid| {
                 let rpc = rpc.clone();
-                let sem = fetch_semaphore.clone();
                 async move {
-                    // Acquire a permit (bounds concurrency globally across
-                    // ticks). It's moved into the blocking closure inside
-                    // `mempool_entry_with_permit` and released only when the RPC
-                    // completes — so a budget-bail that drops this future still
-                    // holds the permit until the orphaned RPC finishes.
-                    let permit = match sem.clone().acquire_owned().await {
-                        Ok(p) => p,
-                        // The semaphore is never closed for the process lifetime;
-                        // treat a closed semaphore as a fetch error rather than
-                        // panicking.
-                        Err(e) => return (txid, Err(anyhow::Error::new(e))),
-                    };
                     (
                         txid,
-                        rpc.mempool_entry_with_permit(&txid, permit)
+                        rpc.mempool_entry(&txid)
                             .await
                             .map(|opt| opt.map(|e| MempoolTx::from(&e))),
                     )
@@ -339,9 +320,9 @@ pub async fn run(
             // ready without awaiting new work (`now_or_never`), so completed
             // fetches this tick aren't thrown away just because we crossed the
             // budget. In-flight (not-yet-ready) futures are dropped when we
-            // `break`; their permits are still held inside their spawn_blocking
-            // closures until those RPCs finish, and the txids reappear in next
-            // tick's `diff.new`.
+            // `break`; dropping a reqwest request future cancels it, so no
+            // orphaned work is left running, and those txids simply reappear in
+            // next tick's `diff.new`.
             if fetch_start.elapsed() > cfg.tick_budget {
                 while let Some(Some((txid, res))) = results.next().now_or_never() {
                     process(txid, res, &mut fetched, &mut fetch_errors, &mut resolved);
@@ -398,7 +379,7 @@ async fn bulk_resync(rpc: &mut Rpc, state: &SharedState) -> Option<usize> {
     // cookie. A node restart empties the mempool (triggering a mass-drop
     // resync) AND rotates the cookie, so without this both the initial
     // bulk-load loop and steady-state resyncs would wedge on 401 forever.
-    let reconnect_if_needed = |rpc: &mut Rpc, e: &anyhow::Error| {
+    let reconnect_if_needed = |rpc: &mut Rpc, e: &RpcError| {
         if rpc::is_reconnectable(e) {
             if let Err(re) = rpc.reconnect() {
                 tracing::warn!(error = %short_err(&re), "rpc reconnect failed");

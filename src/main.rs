@@ -3,7 +3,6 @@ mod http;
 mod mempool;
 mod rpc;
 mod sync;
-mod transport;
 mod zmq;
 
 use mempool::MempoolState;
@@ -43,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     attempt += 1;
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             }
         }
     };
@@ -67,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
     // resolve immediately on a closed channel and spin the steady-state loop.
     let _wake_tx = wake_tx;
 
-    // Sync loop as a tokio task (blocking RPC calls run via spawn_blocking).
+    // Sync loop as a tokio task (async RPC over reqwest).
     let sync_state = state.clone();
     let sync_cfg = sync::SyncConfig {
         poll_interval: cfg.poll_interval,

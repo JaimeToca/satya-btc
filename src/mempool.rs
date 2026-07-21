@@ -1,5 +1,5 @@
-use bitcoincore_rpc::bitcoin::{Amount, Network, Txid};
-use bitcoincore_rpc::json::{GetMempoolEntryResult, GetMempoolInfoResult};
+use crate::rpc::{MempoolEntry, MempoolInfo};
+use bitcoin::{Amount, Network, Txid};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::SystemTime;
@@ -24,30 +24,29 @@ pub struct MempoolTx {
     pub descendant_vsize: u32,
 }
 
-impl From<&GetMempoolEntryResult> for MempoolTx {
-    /// Convert a raw `getmempoolentry`/`getrawmempool(true)` result into our `MempoolTx`.
-    fn from(entry: &GetMempoolEntryResult) -> Self {
-        let vsize = entry.vsize as u32;
-        let weight = entry.weight.map(|w| w as u32).unwrap_or(vsize * 4);
+impl From<&MempoolEntry> for MempoolTx {
+    /// Convert a raw `getmempoolentry`/`getrawmempool(true)` entry into our `MempoolTx`.
+    fn from(entry: &MempoolEntry) -> Self {
         MempoolTx {
-            vsize,
-            weight,
+            vsize: entry.vsize as u32,
+            weight: entry.weight as u32,
             fee: entry.fees.base,
             depends: entry.depends.clone(),
             ancestor_fee: entry.fees.ancestor,
-            ancestor_vsize: entry.ancestor_size as u32,
+            ancestor_vsize: entry.ancestorsize as u32,
             descendant_fee: entry.fees.descendant,
-            descendant_vsize: entry.descendant_size as u32,
+            descendant_vsize: entry.descendantsize as u32,
         }
     }
 }
 
 /// Minimum mempool-acceptance fee rate, in sat/vB.
 ///
-/// `getmempoolinfo`'s `mempool_min_fee` is denominated in BTC/kvB; dividing the
-/// satoshi value by 1000 converts kvB to vB, giving sat/vB.
-pub fn min_fee_sat_vb(info: &GetMempoolInfoResult) -> f64 {
-    info.mempool_min_fee.to_sat() as f64 / 1000.0
+/// `getmempoolinfo`'s `mempoolminfee` is denominated in BTC/kvB; the `as_btc`
+/// serde parse already gave us exact sats, and dividing by 1000 converts kvB to
+/// vB, giving sat/vB.
+pub fn min_fee_sat_vb(info: &MempoolInfo) -> f64 {
+    info.mempoolminfee.to_sat() as f64 / 1000.0
 }
 
 #[derive(Debug)]

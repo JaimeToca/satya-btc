@@ -9,15 +9,14 @@ axum = "0.7"
 # Standard tower middleware for axum; `trace` gives per-request tracing spans
 # (method, path, status, latency) that flow into our existing tracing subscriber.
 tower-http = { version = "0.6", features = ["trace"] }
-bitcoincore-rpc = "0.19"
-bitcoin = "0.32"
-# bitcoincore-rpc pulls in jsonrpc's `minreq_http` transport already, but doesn't request
-# minreq's `https` feature. Depending on minreq directly here unifies that feature across the
-# build so the shared jsonrpc/minreq instance gains HTTPS (rustls) support.
-minreq = { version = "2.14", features = ["https"] }
-# Same base64 version `jsonrpc` uses internally for its own basic-auth header encoding; pinned
-# here directly since our custom RPC transport (src/rpc.rs) builds that header itself.
-base64 = "0.13"
+# `serde` gives us Deserialize for Txid/Amount/Network and the amount/network
+# serde helpers (`as_btc`, `as_core_arg`) our hand-rolled RPC response structs
+# rely on. Previously enabled transitively via bitcoincore-rpc.
+bitcoin = { version = "0.32", features = ["serde"] }
+# Async JSON-RPC transport. rustls-tls matches the previous minreq-https TLS
+# stack; `json` gives request/response JSON (body building + parsing).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
