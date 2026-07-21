@@ -96,11 +96,10 @@ pub struct SyncConfig {
     pub verbose: bool,
     /// Interval between steady-state liveness heartbeats. `ZERO` disables them.
     pub heartbeat: Duration,
-    /// Max concurrent `getmempoolentry` calls per tick. Consumed in Task 4
-    /// (concurrent fetch); the loop is still sequential for now.
+    /// Max concurrent `getmempoolentry` calls per tick (via `buffer_unordered`).
     pub fetch_concurrency: usize,
-    /// Max fetch time per tick before bailing and marking stale. Consumed in
-    /// Task 4; unused by the current sequential loop.
+    /// Max fetch time per tick before bailing and marking the state stale
+    /// (`caught_up = false`); the remainder is retried on the next tick.
     pub tick_budget: Duration,
 }
 
