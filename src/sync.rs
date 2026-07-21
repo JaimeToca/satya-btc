@@ -2,13 +2,27 @@ use crate::mempool::{compute_diff, read_state, write_state, SharedState};
 use crate::rpc::Rpc;
 use std::collections::HashSet;
 use std::thread::sleep;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Cache size below which we skip the mass-drop resync check — small mempools
 /// can legitimately shrink by more than 80% during normal operation (e.g. a few
 /// txs all confirming in one block), which would otherwise trigger a needless
 /// full resync.
 const MASS_DROP_MIN_CACHE_SIZE: usize = 100;
+
+/// Maximum number of newly-seen txids we'll fetch full details for in a
+/// single tick. Bounds per-tick RPC volume so an unbounded (or malicious)
+/// mempool can't force one tick to issue hundreds of thousands of sequential
+/// RPCs. Any remainder stays in the node's txid set and reappears in
+/// `diff.new` on the next tick, so nothing is permanently lost — it's just
+/// spread across ticks.
+const MAX_NEW_FETCH_PER_TICK: usize = 2000;
+
+/// Minimum time between `bulk_resync` calls triggered by desync detection
+/// (node reload / mass drop). Without this, a provider or node that flaps
+/// `loaded=false` or oscillates mempool size can force a full verbose
+/// mempool download on nearly every tick.
+const RESYNC_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Blocking loop; call on a dedicated std::thread. Never returns under normal operation.
 pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
@@ -27,8 +41,10 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
         sleep(poll_interval);
     }
 
+    let mut last_bulk_resync: Option<Instant>;
     loop {
         if bulk_resync(&mut rpc, &state) {
+            last_bulk_resync = Some(Instant::now());
             break;
         }
         tracing::warn!("initial bulk resync failed; retrying");
@@ -67,6 +83,19 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
             && node_txids.len().saturating_mul(5) < cache_len;
 
         if !info.loaded || mass_drop {
+            let cooling_down = last_bulk_resync
+                .is_some_and(|t| t.elapsed() < RESYNC_COOLDOWN);
+            if cooling_down {
+                tracing::warn!(
+                    loaded = info.loaded,
+                    mass_drop,
+                    node_txid_count = node_txids.len(),
+                    cache_len,
+                    "mempool desync detected but bulk resync is in cooldown; waiting it out"
+                );
+                mark_stale(&state);
+                continue;
+            }
             tracing::warn!(
                 loaded = info.loaded,
                 mass_drop,
@@ -74,6 +103,7 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
                 cache_len,
                 "mempool desync detected (node reload or mass drop); resyncing from scratch"
             );
+            last_bulk_resync = Some(Instant::now());
             if !bulk_resync(&mut rpc, &state) {
                 mark_stale(&state);
             }
@@ -92,22 +122,33 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
             }
         }
 
-        // Fetch adds best-effort: a single failed fetch doesn't abort the
-        // batch or discard txs already fetched this tick.
-        let mut fetched = Vec::with_capacity(diff.new.len());
-        for txid in &diff.new {
+        // Fetch adds best-effort and bounded: a single failed fetch doesn't
+        // abort the batch or discard txs already fetched this tick, and we
+        // only fetch up to MAX_NEW_FETCH_PER_TICK per tick. Anything left
+        // over stays absent from the cache, so it's still in `diff.new` (and
+        // gets fetched) next tick — nothing is permanently lost.
+        let mut fetched = Vec::with_capacity(diff.new.len().min(MAX_NEW_FETCH_PER_TICK));
+        let mut fetch_errors = 0usize;
+        for txid in diff.new.iter().take(MAX_NEW_FETCH_PER_TICK) {
             match rpc.mempool_entry(txid) {
                 Ok(Some(tx)) => fetched.push((*txid, tx)),
                 Ok(None) => {
                     // Vanished between listing and fetch; nothing to add.
                 }
                 Err(e) => {
+                    fetch_errors += 1;
                     tracing::warn!(error = %e, %txid, "mempool_entry fetch failed; will retry next tick");
                 }
             }
         }
 
         let tip_height = rpc.tip_height().ok();
+
+        // Only promote to "caught up" when this tick fully resolved the
+        // node's new-txid list (didn't hit the per-tick cap, and every fetch
+        // either succeeded or the tx had already vanished). Otherwise the
+        // cache is known to be behind the node, so `/health` should say so.
+        let backlog = diff.new.len() > MAX_NEW_FETCH_PER_TICK || fetch_errors > 0;
 
         {
             let mut g = write_state(&state);
@@ -118,8 +159,12 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
             if let Some(h) = tip_height {
                 g.tip_height = h;
             }
-            g.caught_up = true;
-            g.last_sync_ok = Some(SystemTime::now());
+            if backlog {
+                g.caught_up = false;
+            } else {
+                g.caught_up = true;
+                g.last_sync_ok = Some(SystemTime::now());
+            }
         }
     }
 }
