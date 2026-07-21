@@ -6,7 +6,7 @@ node — as the foundation for **accurate fee recommendations**. One static bina
 database, no Redis, no explorer.
 
 **Status:** the mempool builder (Phase 1) is shipped and hardened. A fee-latency phase
-(Phase 2 — concurrent fetch, ZMQ block-push, freshness signals) is in progress. The fee
+(Phase 2 — concurrent fetch, ZMQ block-push, freshness signals) is complete. The fee
 estimator itself (Phase 3 — a GBT-style assembler and a `/fees` endpoint) is the end
 goal. See the [Roadmap](#5-roadmap).
 
@@ -23,7 +23,7 @@ The project is built in focused phases, each shipping working software on its ow
 
 - **Phase 1 — mempool builder (done):** RPC connection, diff-based mempool sync, shared
   state, and a `/health` endpoint.
-- **Phase 2 — fee latency (in progress):** drive mempool freshness toward mempool.space
+- **Phase 2 — fee latency (done):** drive mempool freshness toward mempool.space
   parity — bounded concurrent fetch, ZMQ block-push for instant post-block recompute, a
   time-based freshness guard, and package (ancestor/descendant) data capture.
 - **Phase 3 — fees (planned):** a GBT-style block assembler and a `/fees` endpoint.
@@ -101,27 +101,26 @@ emitting a spurious "mempool cleared".
 list; any RPC error, backlog, or outage flips it `false`, and `last_sync_ok` records the
 last good sync so a consumer can tell "never synced" from "synced N seconds ago".
 
-### Freshness & latency — Phase 2 (in progress)
+### Freshness & latency
 
-Phase 1's steady-state fetch is **sequential** (one `getmempoolentry` per new tx). Against
+Phase 1's steady-state fetch was **sequential** (one `getmempoolentry` per new tx). Against
 a local node that is sub-millisecond; against latency, or during a post-block refill burst
 even locally, a tick can run long and the mempool view silently lags — precisely the data a
 fee estimate sits on. Phase 2 closes that gap:
 
-- **Bounded concurrent fetch** (`FETCH_CONCURRENCY`, default 10) — fetch new-tx details in
+- **Bounded concurrent fetch** (`FETCH_CONCURRENCY`, default 10) — fetches new-tx details in
   parallel instead of one at a time.
-- **ZMQ block-push** (`BTC_ZMQ_BLOCK`) — subscribe to the node's `zmqpubhashblock` so a new
+- **ZMQ block-push** (`BTC_ZMQ_BLOCK`) — subscribes to the node's `zmqpubhashblock` so a new
   block triggers an *immediate* recompute instead of waiting for the next poll. A block is
   when fees swing most, so this is the highest-leverage freshness win. Polling remains the
   baseline; ZMQ is an opt-in accelerator.
 - **Time-based freshness guard** (`TICK_BUDGET_MS`) — if a tick's fetch overruns its budget,
-  stop and mark `caught_up=false` rather than let a slow tick masquerade as fresh.
-- **Package data** — capture ancestor/descendant fee+size (already returned by
+  it stops and marks `caught_up=false` rather than let a slow tick masquerade as fresh.
+- **Package data** — captures ancestor/descendant fee+size (already returned by
   `getmempoolentry`) so the Phase-3 assembler can rank by *effective* (CPFP-aware) fee rate.
 
-These knobs are present in the configuration but are being wired in over Phase 2; see the
-[Roadmap](#5-roadmap) for current status. ZMQ is a raw socket on the node, so this path
-assumes a **local node** — which is the intended deployment anyway.
+ZMQ is a raw socket on the node, so this path assumes a **local node** — which is the
+intended deployment anyway.
 
 ### Correctness notes
 
@@ -208,7 +207,8 @@ curl -s http://127.0.0.1:8080/health | jq
   "tip_height": 850000,
   "mempool_min_fee_sat_vb": 1.0,
   "network": "bitcoin",
-  "last_sync_ok": 1721557200
+  "last_sync_ok": 1721557200,
+  "age_secs": 2
 }
 ```
 
@@ -228,11 +228,9 @@ work). Only the RPC connection is required; everything else has a default.
 | `RPC_TIMEOUT_SECS`      | `30`                    | Timeout for each Bitcoin Core RPC call, seconds. |
 | `SYNC_LOG_VERBOSE`      | `false`                 | Log one INFO line per sync tick. Accepts `true/false/1/0/yes/no`. |
 | `HEARTBEAT_SECS`        | `30`                    | Seconds between steady-state liveness heartbeat logs; `0` disables. |
-| `FETCH_CONCURRENCY` ⏳   | `10`                    | *(Phase 2)* Max concurrent `getmempoolentry` calls per tick. Bound by node `rpcthreads`/`rpcworkqueue`. |
-| `BTC_ZMQ_BLOCK` ⏳       | —                       | *(Phase 2)* Node `zmqpubhashblock` endpoint for immediate recompute on new blocks. Unset = polling only. |
-| `TICK_BUDGET_MS` ⏳      | `2 × POLL_INTERVAL_MS`  | *(Phase 2)* Max fetch time per tick before bailing and marking stale. |
-
-⏳ = accepted by the binary now; behavior is being wired in over Phase 2.
+| `FETCH_CONCURRENCY`     | `10`                    | Max concurrent `getmempoolentry` calls per tick. Bound by node `rpcthreads`/`rpcworkqueue`. |
+| `BTC_ZMQ_BLOCK`         | —                       | Node `zmqpubhashblock` endpoint for immediate recompute on new blocks. Unset = polling only. |
+| `TICK_BUDGET_MS`        | `2 × POLL_INTERVAL_MS`  | Max fetch time per tick before bailing and marking stale. |
 
 **Authentication:** provide `BTC_RPC_COOKIE_FILE`, **or** both `BTC_RPC_USER` and
 `BTC_RPC_PASS`, **or neither** — omit auth when the endpoint carries its credential in the
@@ -253,6 +251,7 @@ flags instead).
 | `mempool_min_fee_sat_vb` | number        | The node's current mempool min fee, in sat/vB (the eviction floor).     |
 | `network`                | string        | Network inferred from the node (`bitcoin`, `testnet`, `signet`, `regtest`). |
 | `last_sync_ok`           | number \| null | Unix seconds of the last successful sync, or `null` if never synced.    |
+| `age_secs`               | number \| null | Seconds since the last successful sync (`last_sync_ok`); `null` if never synced. A freshness signal for consumers. |
 
 ### Logging
 
@@ -278,7 +277,7 @@ each request emits an INFO line with method, path, status, and latency.
 |-------|-------|--------|
 | **1** | Mempool builder — RPC, diff-sync, shared state, `/health` | ✅ done |
 | **1.1** | Hardening — honest `caught_up`, RPC timeout + cookie-rotation reconnect, resilient fetch, supervised sync task | ✅ done |
-| **2** | Fee latency — package-data capture, config knobs, tokio migration, bounded concurrent fetch + time-budget bail, ZMQ block-push, freshness signal | ⏳ in progress |
+| **2** | Fee latency — package-data capture, config knobs, tokio migration, bounded concurrent fetch + time-budget bail, ZMQ block-push, freshness signal | ✅ done |
 | **3** | Fees — GBT-style CPFP-aware block assembler; `/fees` endpoint with recommended tiers, gated on `caught_up` | ⏳ planned |
 
 **Beyond:** an optional Esplora/electrs adapter, WebSocket push to clients, connection
