@@ -71,8 +71,6 @@ async fn main() -> anyhow::Result<()> {
     let sync_state = state.clone();
     let sync_cfg = sync::SyncConfig {
         poll_interval: cfg.poll_interval,
-        verbose: cfg.sync_log_verbose,
-        heartbeat: cfg.heartbeat,
         fetch_concurrency: cfg.fetch_concurrency,
         tick_budget: cfg.tick_budget,
     };

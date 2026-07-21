@@ -226,8 +226,6 @@ work). Only the RPC connection is required; everything else has a default.
 | `HTTP_BIND`             | `127.0.0.1:8080`        | Address the HTTP server binds to.                |
 | `POLL_INTERVAL_MS`      | `2000`                  | Mempool poll interval, in milliseconds.          |
 | `RPC_TIMEOUT_SECS`      | `30`                    | Timeout for each Bitcoin Core RPC call, seconds. |
-| `SYNC_LOG_VERBOSE`      | `false`                 | Log one INFO line per sync tick. Accepts `true/false/1/0/yes/no`. |
-| `HEARTBEAT_SECS`        | `30`                    | Seconds between steady-state liveness heartbeat logs; `0` disables. |
 | `FETCH_CONCURRENCY`     | `10`                    | Max concurrent `getmempoolentry` calls per tick. Bound by node `rpcthreads`/`rpcworkqueue`. |
 | `BTC_ZMQ_BLOCK`         | —                       | Node `zmqpubhashblock` endpoint for immediate recompute on new blocks. Unset = polling only. |
 | `TICK_BUDGET_MS`        | `2 × POLL_INTERVAL_MS`  | Max fetch time per tick before bailing and marking stale. |
@@ -256,13 +254,14 @@ flags instead).
 ### Logging
 
 Logging is structured (via `tracing`) and follows `RUST_LOG` (defaults to `info`). By
-design the sync loop is quiet in steady state — it logs sync-state transitions, errors,
-and a periodic heartbeat, not one line per tick — so `info` stays readable in production.
+design the sync loop is **silent when healthy** — it logs sync-state transitions (e.g.
+"mempool in sync" / "mempool out of sync") and lifecycle events, not one line per tick,
+so `info` stays readable in production. Control-plane RPC errors (`mempool_info failed`,
+`raw_mempool_txids failed`, and the `bulk_resync` RPC failures) surface at `warn` so a
+real problem is visible without turning on debug logging.
 
 | I want to see…                        | Set                                          |
 |---------------------------------------|----------------------------------------------|
-| One line per sync tick                | `SYNC_LOG_VERBOSE=true`                       |
-| A liveness heartbeat every N seconds  | `HEARTBEAT_SECS=N` (default 30; `0` off)      |
 | Every RPC call to the node            | `RUST_LOG=info,bitcoincore_rpc=debug`         |
 | RPC calls **and** full responses      | `RUST_LOG=info,bitcoincore_rpc=trace` (loud)  |
 | HTTP request access log               | on at `info` by default (method/path/status/latency) |

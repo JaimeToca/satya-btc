@@ -95,33 +95,11 @@ const RESYNC_COOLDOWN: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, Copy)]
 pub struct SyncConfig {
     pub poll_interval: Duration,
-    /// Log one INFO line per tick (adds/removes/size/tip). Off = quiet steady state.
-    pub verbose: bool,
-    /// Interval between steady-state liveness heartbeats. `ZERO` disables them.
-    pub heartbeat: Duration,
     /// Max concurrent `getmempoolentry` calls per tick (via `buffer_unordered`).
     pub fetch_concurrency: usize,
     /// Max fetch time per tick before bailing and marking the state stale
     /// (`caught_up = false`); the remainder is retried on the next tick.
     pub tick_budget: Duration,
-}
-
-/// Emit a liveness heartbeat at INFO if `interval` has elapsed since `last`,
-/// then reset `last`. Fires regardless of sync outcome (including during an
-/// outage) so operators can see the process is still ticking. A zero interval
-/// disables it. Reads the current cache under a short lock.
-fn maybe_heartbeat(state: &SharedState, last: &mut Instant, interval: Duration) {
-    if interval.is_zero() || last.elapsed() < interval {
-        return;
-    }
-    *last = Instant::now();
-    let g = read_state(state);
-    tracing::info!(
-        mempool_size = g.txs.len(),
-        tip_height = g.tip_height,
-        caught_up = g.caught_up,
-        "heartbeat"
-    );
 }
 
 /// Async sync loop; spawn on the tokio runtime. Never returns under normal
@@ -144,7 +122,7 @@ pub async fn run(
                 tracing::info!("waiting for node mempool to finish loading");
             }
             Err(e) => {
-                tracing::debug!(error = %short_err(&e), "error checking mempool_info during startup");
+                tracing::warn!(error = %short_err(&e), "error checking mempool_info during startup");
                 // A node restart rotates the cookie; rebuild the client before
                 // the retry sleep so we don't spin on 401 forever at startup.
                 if rpc::is_reconnectable(&e) {
@@ -183,7 +161,6 @@ pub async fn run(
     // dropped) still holds its permit until the underlying RPC finishes,
     // protecting bitcoind's `rpcworkqueue` from a pile-up across ticks.
     let fetch_semaphore = Arc::new(Semaphore::new(cfg.fetch_concurrency));
-    let mut last_heartbeat = Instant::now();
     loop {
         // Interruptible wait: either the poll interval elapses, or a ZMQ block
         // event wakes us early (wire-up in Task 5).
@@ -191,15 +168,11 @@ pub async fn run(
             _ = tokio::time::sleep(poll_interval) => {}
             _ = wake_rx.recv() => {}
         }
-        // Checked up front so the heartbeat still fires on ticks that `continue`
-        // early (RPC errors, desync cooldown) — i.e. exactly when liveness is
-        // most in doubt.
-        maybe_heartbeat(&state, &mut last_heartbeat, cfg.heartbeat);
 
         let info = match rpc.mempool_info().await {
             Ok(info) => info,
             Err(e) => {
-                tracing::debug!(error = %short_err(&e), "mempool_info failed");
+                tracing::warn!(error = %short_err(&e), "mempool_info failed");
                 if rpc::is_reconnectable(&e) {
                     if let Err(re) = rpc.reconnect() {
                         tracing::warn!(error = %short_err(&re), "rpc reconnect failed");
@@ -222,7 +195,7 @@ pub async fn run(
         let node_txids: HashSet<_> = match rpc.raw_mempool_txids().await {
             Ok(txids) => txids.into_iter().collect(),
             Err(e) => {
-                tracing::debug!(error = %short_err(&e), "raw_mempool_txids failed");
+                tracing::warn!(error = %short_err(&e), "raw_mempool_txids failed");
                 if rpc::is_reconnectable(&e) {
                     if let Err(re) = rpc.reconnect() {
                         tracing::warn!(error = %short_err(&re), "rpc reconnect failed");
@@ -375,19 +348,6 @@ pub async fn run(
                 }
                 break;
             }
-            // Against a high-latency provider a single tick's fetch can run for
-            // many seconds; emit a throttled progress line (same cadence as the
-            // heartbeat) so a long tick still shows liveness instead of going
-            // dark. Resets `last_heartbeat` so the top-of-loop heartbeat keeps
-            // one steady cadence.
-            if !cfg.heartbeat.is_zero() && last_heartbeat.elapsed() >= cfg.heartbeat {
-                last_heartbeat = Instant::now();
-                tracing::info!(
-                    fetched = fetched.len(),
-                    to_fetch,
-                    "sync in progress (fetching new mempool entries)"
-                );
-            }
         }
         // Stale only if candidates remain unresolved after the (drained) stop —
         // NOT merely because wall-clock time crossed the budget.
@@ -407,33 +367,6 @@ pub async fn run(
         // counts already in hand rather than re-reading the cache under lock
         // just for a log field.
         let mempool_size = cache_len - diff.gone.len() + fetched.len();
-
-        // Per-tick detail: INFO when the operator asked for it (SYNC_LOG_VERBOSE),
-        // otherwise DEBUG so it's there under RUST_LOG=...=debug but silent in
-        // normal steady-state operation. Same fields either way.
-        if cfg.verbose {
-            tracing::info!(
-                new = diff.new.len(),
-                gone = diff.gone.len(),
-                fetched = fetched.len(),
-                mempool_size,
-                tip_height = ?tip_height,
-                backlog,
-                budget_exceeded,
-                "sync tick"
-            );
-        } else {
-            tracing::debug!(
-                new = diff.new.len(),
-                gone = diff.gone.len(),
-                fetched = fetched.len(),
-                mempool_size,
-                tip_height = ?tip_height,
-                backlog,
-                budget_exceeded,
-                "sync tick"
-            );
-        }
 
         {
             let mut g = write_state(&state);
@@ -475,7 +408,7 @@ async fn bulk_resync(rpc: &mut Rpc, state: &SharedState) -> Option<usize> {
     let entries = match rpc.raw_mempool_verbose().await {
         Ok(entries) => entries,
         Err(e) => {
-            tracing::debug!(error = %short_err(&e), "raw_mempool_verbose failed during bulk resync");
+            tracing::warn!(error = %short_err(&e), "raw_mempool_verbose failed during bulk resync");
             reconnect_if_needed(rpc, &e);
             return None;
         }
@@ -483,7 +416,7 @@ async fn bulk_resync(rpc: &mut Rpc, state: &SharedState) -> Option<usize> {
     let info = match rpc.mempool_info().await {
         Ok(info) => info,
         Err(e) => {
-            tracing::debug!(error = %short_err(&e), "mempool_info failed during bulk resync");
+            tracing::warn!(error = %short_err(&e), "mempool_info failed during bulk resync");
             reconnect_if_needed(rpc, &e);
             return None;
         }
@@ -491,7 +424,7 @@ async fn bulk_resync(rpc: &mut Rpc, state: &SharedState) -> Option<usize> {
     let tip_height = match rpc.tip_height().await {
         Ok(h) => h,
         Err(e) => {
-            tracing::debug!(error = %short_err(&e), "tip_height failed during bulk resync");
+            tracing::warn!(error = %short_err(&e), "tip_height failed during bulk resync");
             reconnect_if_needed(rpc, &e);
             return None;
         }
