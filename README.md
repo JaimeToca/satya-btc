@@ -71,8 +71,7 @@ serving `/health`.
 | Module      | Responsibility                                                        |
 |-------------|-----------------------------------------------------------------------|
 | `config`    | Parse configuration from environment variables / CLI flags.           |
-| `transport` | The custom JSON-RPC HTTP transport (auth, custom headers, timeout).   |
-| `rpc`       | Typed wrapper over `bitcoincore-rpc` for the handful of calls we use.  |
+| `rpc`       | Async JSON-RPC client over `reqwest` (auth, timeout, the calls we use).|
 | `mempool`   | The `MempoolTx` / `MempoolState` model and the diff/apply logic.       |
 | `sync`      | The poll loop: cold-load, steady-state diff, restart guard.            |
 | `http`      | The axum router and `/health` handler.                                 |
@@ -222,7 +221,6 @@ work). Only the RPC connection is required; everything else has a default.
 | `BTC_RPC_URL`           | `http://127.0.0.1:8332` | Bitcoin Core JSON-RPC URL (`http://` local or `https://` provider). |
 | `BTC_RPC_COOKIE_FILE`   | —                       | Path to the node's `.cookie` file.               |
 | `BTC_RPC_USER` / `_PASS`| —                       | RPC username / password (used together).         |
-| `BTC_RPC_HEADERS`       | —                       | Extra request headers, `Name: Value`, comma-separated (or repeat `--rpc-header`). For API-key providers. |
 | `HTTP_BIND`             | `127.0.0.1:8080`        | Address the HTTP server binds to.                |
 | `POLL_INTERVAL_MS`      | `2000`                  | Mempool poll interval, in milliseconds.          |
 | `RPC_TIMEOUT_SECS`      | `30`                    | Timeout for each Bitcoin Core RPC call, seconds. |
@@ -234,10 +232,7 @@ work). Only the RPC connection is required; everything else has a default.
 `BTC_RPC_PASS`, **or neither** — omit auth when the endpoint carries its credential in the
 URL (hosted providers like GetBlock, e.g. `https://go.getblock.io/<KEY>`). A cookie file
 takes precedence; it's the usual choice for a local node (Bitcoin Core writes it to its
-data directory, e.g. `~/.bitcoin/.cookie` on mainnet). For API-key-header providers, set
-`BTC_RPC_HEADERS="X-Api-Key: your_key"` (additive with any auth mode). Because the env var
-is comma-separated, avoid header *values* containing a comma (use repeated `--rpc-header`
-flags instead).
+data directory, e.g. `~/.bitcoin/.cookie` on mainnet).
 
 ### `/health` fields
 
@@ -262,8 +257,7 @@ real problem is visible without turning on debug logging.
 
 | I want to see…                        | Set                                          |
 |---------------------------------------|----------------------------------------------|
-| Every RPC call to the node            | `RUST_LOG=info,bitcoincore_rpc=debug`         |
-| RPC calls **and** full responses      | `RUST_LOG=info,bitcoincore_rpc=trace` (loud)  |
+| Per-tx fetch failures + desync detail | `RUST_LOG=info,btc_indexer::sync=debug`       |
 | HTTP request access log               | on at `info` by default (method/path/status/latency) |
 | …but silence the frequent `/health`   | `RUST_LOG=info,tower_http::trace=warn`        |
 

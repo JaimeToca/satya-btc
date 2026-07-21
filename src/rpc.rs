@@ -43,9 +43,6 @@ pub struct Rpc {
     http: reqwest::Client,
     url: String,
     auth: Auth,
-    /// Additional `Name: Value` HTTP headers sent with every request (e.g. a
-    /// provider API key header). Applied per request.
-    headers: Vec<(String, String)>,
     /// Kept so `reconnect` can rebuild the client and re-read a rotated cookie.
     cfg: RpcConfig,
 }
@@ -158,14 +155,13 @@ impl Rpc {
             http,
             url: cfg.url.clone(),
             auth: resolve_auth(cfg)?,
-            headers: cfg.headers.clone(),
             cfg: cfg.clone(),
         })
     }
 
     /// The single request/parse path — every typed method funnels through here.
     ///
-    /// Builds the JSON-RPC request, POSTs it with auth + custom headers (the
+    /// Builds the JSON-RPC request, POSTs it with auth (the
     /// per-request timeout is baked into the `reqwest::Client`), maps HTTP
     /// 401/403 to `Auth` and other non-success statuses to `HttpStatus`, then
     /// parses the `{result, error}` envelope: a non-null `error` becomes `Rpc`,
@@ -190,9 +186,6 @@ impl Rpc {
         let mut req = self.http.post(&self.url).json(&body);
         if let Auth::Basic { user, pass } = &self.auth {
             req = req.basic_auth(user, Some(pass));
-        }
-        for (name, value) in &self.headers {
-            req = req.header(name, value);
         }
 
         let resp = req
