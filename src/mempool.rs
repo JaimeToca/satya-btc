@@ -10,6 +10,10 @@ pub struct MempoolTx {
     pub weight: u32,
     pub fee: Amount,
     pub depends: Vec<Txid>,
+    pub ancestor_fee: Amount,
+    pub ancestor_vsize: u32,
+    pub descendant_fee: Amount,
+    pub descendant_vsize: u32,
 }
 
 impl From<&GetMempoolEntryResult> for MempoolTx {
@@ -22,6 +26,10 @@ impl From<&GetMempoolEntryResult> for MempoolTx {
             weight,
             fee: entry.fees.base,
             depends: entry.depends.clone(),
+            ancestor_fee: entry.fees.ancestor,
+            ancestor_vsize: entry.ancestor_size as u32,
+            descendant_fee: entry.fees.descendant,
+            descendant_vsize: entry.descendant_size as u32,
         }
     }
 }
