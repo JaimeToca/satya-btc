@@ -8,18 +8,18 @@ use std::time::{Duration, Instant, SystemTime};
 /// huge (or secret-bearing) provider error body can't blow up the logs.
 const MAX_ERR_LOG_LEN: usize = 200;
 
-/// Format an error and truncate it to `MAX_ERR_LOG_LEN` chars, so oversized
-/// error bodies (e.g. from a misbehaving RPC provider) don't get logged in
-/// full.
+/// Format an error (including its full `anyhow` source/cause chain, via the
+/// alternate `{:#}` form) and truncate it to `MAX_ERR_LOG_LEN` chars in a
+/// single pass, so oversized error bodies (e.g. from a misbehaving RPC
+/// provider) don't get logged in full.
 fn short_err(e: &anyhow::Error) -> String {
-    let full = format!("{e}");
-    if full.chars().count() > MAX_ERR_LOG_LEN {
-        let mut s: String = full.chars().take(MAX_ERR_LOG_LEN).collect();
+    let full = format!("{e:#}");
+    let mut chars = full.chars();
+    let mut s: String = chars.by_ref().take(MAX_ERR_LOG_LEN).collect();
+    if chars.next().is_some() {
         s.push('…');
-        s
-    } else {
-        full
     }
+    s
 }
 
 /// Set `state.caught_up` (state-write semantics unchanged from the previous
@@ -90,23 +90,22 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
         sleep(poll_interval);
     }
 
+    // Tracks the previously-logged `caught_up` value so we only emit a
+    // transition log on the edge (see `set_synced`), not every tick. Starts
+    // `false` so the initial bulk resync below logs the false->true edge via
+    // `set_synced` instead of unconditionally.
+    let mut caught_up_prev = false;
+
     let mut last_bulk_resync: Option<Instant>;
     loop {
         if let Some(count) = bulk_resync(&mut rpc, &state) {
             last_bulk_resync = Some(Instant::now());
-            tracing::info!(mempool_size = count, "mempool in sync");
+            set_synced(&state, &mut caught_up_prev, true, "", count);
             break;
         }
         tracing::warn!("initial bulk resync failed; retrying");
         sleep(poll_interval);
     }
-
-    // Tracks the previously-logged `caught_up` value so we only emit a
-    // transition log on the edge (see `set_synced`), not every tick. The
-    // initial bulk resync above set `caught_up = true` in state (and we just
-    // logged the corresponding "mempool in sync" line directly), so start
-    // this tracker in sync too.
-    let mut caught_up_prev = true;
 
     // --- Steady-state loop. ---
     loop {
@@ -166,10 +165,7 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
             );
             last_bulk_resync = Some(Instant::now());
             match bulk_resync(&mut rpc, &state) {
-                Some(count) => {
-                    caught_up_prev = true;
-                    tracing::info!(mempool_size = count, "mempool in sync");
-                }
+                Some(count) => set_synced(&state, &mut caught_up_prev, true, "", count),
                 None => set_synced(&state, &mut caught_up_prev, false, "resync_failed", 0),
             }
             continue;

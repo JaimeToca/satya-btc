@@ -94,9 +94,15 @@ impl HeaderTransport {
             Ok(json) => Ok(json),
             Err(minreq_err) => {
                 if resp.status_code != 200 {
+                    let raw = resp.as_str().unwrap_or("");
+                    let mut chars = raw.chars();
+                    let mut body: String = chars.by_ref().take(MAX_ERR_BODY_LEN).collect();
+                    if chars.next().is_some() {
+                        body.push('…');
+                    }
                     Err(HeaderTransportError::Http {
                         status_code: resp.status_code,
-                        body: resp.as_str().unwrap_or("").to_string(),
+                        body,
                     })
                 } else {
                     Err(HeaderTransportError::Minreq(minreq_err))
@@ -119,6 +125,11 @@ impl Transport for HeaderTransport {
         write!(f, "{}", self.url)
     }
 }
+
+/// Maximum number of characters of a provider HTTP error body we keep. Bounds
+/// the transient allocation at the source, so a multi-MB (or malicious)
+/// provider error response body is never materialized in full.
+const MAX_ERR_BODY_LEN: usize = 512;
 
 /// Error type for [`HeaderTransport`], analogous to `jsonrpc::http::minreq_http::Error`.
 #[derive(Debug)]
