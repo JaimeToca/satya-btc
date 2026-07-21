@@ -1,4 +1,4 @@
-use crate::mempool::{compute_diff, read_state, write_state, SharedState};
+use crate::mempool::{self, compute_diff, read_state, write_state, MempoolTx, SharedState};
 use crate::rpc::Rpc;
 use std::collections::HashSet;
 use std::thread::sleep;
@@ -30,7 +30,8 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
     // initial full load before entering steady state. ---
     loop {
         match rpc.mempool_info() {
-            Ok(info) if info.loaded => break,
+            // Older nodes don't report `loaded` at all; treat that as loaded.
+            Ok(info) if info.loaded.unwrap_or(true) => break,
             Ok(_) => {
                 tracing::info!("waiting for node mempool to finish loading");
             }
@@ -63,6 +64,9 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
                 continue;
             }
         };
+        // Older nodes don't report `loaded` at all; treat that as loaded.
+        let loaded = info.loaded.unwrap_or(true);
+        let min_fee_sat_vb = mempool::min_fee_sat_vb(&info);
 
         let node_txids: HashSet<_> = match rpc.raw_mempool_txids() {
             Ok(txids) => txids.into_iter().collect(),
@@ -82,12 +86,12 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
         let mass_drop = cache_len >= MASS_DROP_MIN_CACHE_SIZE
             && node_txids.len().saturating_mul(5) < cache_len;
 
-        if !info.loaded || mass_drop {
+        if !loaded || mass_drop {
             let cooling_down = last_bulk_resync
                 .is_some_and(|t| t.elapsed() < RESYNC_COOLDOWN);
             if cooling_down {
                 tracing::warn!(
-                    loaded = info.loaded,
+                    loaded,
                     mass_drop,
                     node_txid_count = node_txids.len(),
                     cache_len,
@@ -97,7 +101,7 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
                 continue;
             }
             tracing::warn!(
-                loaded = info.loaded,
+                loaded,
                 mass_drop,
                 node_txid_count = node_txids.len(),
                 cache_len,
@@ -130,7 +134,7 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
         let mut fetched = Vec::with_capacity(diff.new.len().min(MAX_NEW_FETCH_PER_TICK));
         let mut fetch_errors = 0usize;
         for txid in diff.new.iter().take(MAX_NEW_FETCH_PER_TICK) {
-            match rpc.mempool_entry(txid) {
+            match rpc.mempool_entry(txid).map(|opt| opt.map(|e| MempoolTx::from(&e))) {
                 Ok(Some(tx)) => fetched.push((*txid, tx)),
                 Ok(None) => {
                     // Vanished between listing and fetch; nothing to add.
@@ -155,7 +159,7 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
             for (txid, tx) in fetched {
                 g.txs.insert(txid, tx);
             }
-            g.mempool_min_fee_sat_vb = info.min_fee_sat_vb;
+            g.mempool_min_fee_sat_vb = min_fee_sat_vb;
             if let Some(h) = tip_height {
                 g.tip_height = h;
             }
@@ -199,8 +203,11 @@ fn bulk_resync(rpc: &mut Rpc, state: &SharedState) -> bool {
     let count = entries.len();
     {
         let mut g = write_state(state);
-        g.txs = entries.into_iter().collect();
-        g.mempool_min_fee_sat_vb = info.min_fee_sat_vb;
+        g.txs = entries
+            .into_iter()
+            .map(|(txid, entry)| (txid, MempoolTx::from(&entry)))
+            .collect();
+        g.mempool_min_fee_sat_vb = mempool::min_fee_sat_vb(&info);
         g.tip_height = tip_height;
         g.caught_up = true;
         g.last_sync_ok = Some(SystemTime::now());

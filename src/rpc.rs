@@ -5,9 +5,11 @@ use std::time::Duration;
 use bitcoincore_rpc::bitcoin::{Network, Txid};
 use bitcoincore_rpc::jsonrpc;
 use bitcoincore_rpc::jsonrpc::{Request, Response, Transport};
-use bitcoincore_rpc::{json::GetMempoolEntryResult, Client, RpcApi};
+use bitcoincore_rpc::{
+    json::{GetMempoolEntryResult, GetMempoolInfoResult},
+    Client, RpcApi,
+};
 use crate::config::{RpcAuth, RpcConfig};
-use crate::mempool::MempoolTx;
 
 pub struct Rpc {
     client: Client,
@@ -17,12 +19,6 @@ pub struct Rpc {
 /// Bitcoin Core's "transaction not in mempool" JSON-RPC error code
 /// (`RPC_INVALID_ADDRESS_OR_KEY`).
 const RPC_INVALID_ADDRESS_OR_KEY: i32 = -5;
-
-/// Combined mempool status from a single `getmempoolinfo` call.
-pub struct MempoolInfo {
-    pub loaded: bool,
-    pub min_fee_sat_vb: f64,
-}
 
 impl Rpc {
     pub fn connect(cfg: &RpcConfig) -> anyhow::Result<Self> {
@@ -38,38 +34,26 @@ impl Rpc {
         self.with_reconnect(|c| Ok(c.get_blockchain_info()?.blocks))
     }
 
-    /// Combined mempool status from a single `getmempoolinfo` call.
-    pub fn mempool_info(&mut self) -> anyhow::Result<MempoolInfo> {
-        self.with_reconnect(|c| {
-            let info = c.get_mempool_info()?;
-            // Older nodes don't report `loaded` at all; treat that as loaded.
-            let loaded = info.loaded.unwrap_or(true);
-            let min_fee_sat_vb = info.mempool_min_fee.to_sat() as f64 / 1000.0;
-            Ok(MempoolInfo { loaded, min_fee_sat_vb })
-        })
+    /// Raw mempool status from a single `getmempoolinfo` call.
+    pub fn mempool_info(&mut self) -> anyhow::Result<GetMempoolInfoResult> {
+        self.with_reconnect(|c| Ok(c.get_mempool_info()?))
     }
 
     pub fn raw_mempool_txids(&mut self) -> anyhow::Result<Vec<Txid>> {
         self.with_reconnect(|c| Ok(c.get_raw_mempool()?))
     }
 
-    pub fn raw_mempool_verbose(&mut self) -> anyhow::Result<Vec<(Txid, MempoolTx)>> {
-        self.with_reconnect(|c| {
-            let entries = c.get_raw_mempool_verbose()?;
-            Ok(entries
-                .into_iter()
-                .map(|(txid, entry)| {
-                    let tx = entry_to_tx(&entry);
-                    (txid, tx)
-                })
-                .collect())
-        })
+    pub fn raw_mempool_verbose(&mut self) -> anyhow::Result<Vec<(Txid, GetMempoolEntryResult)>> {
+        self.with_reconnect(|c| Ok(c.get_raw_mempool_verbose()?.into_iter().collect()))
     }
 
     /// `Ok(None)` if the tx disappeared between listing and fetch.
-    pub fn mempool_entry(&mut self, txid: &Txid) -> anyhow::Result<Option<MempoolTx>> {
+    pub fn mempool_entry(
+        &mut self,
+        txid: &Txid,
+    ) -> anyhow::Result<Option<GetMempoolEntryResult>> {
         self.with_reconnect(|c| match c.get_mempool_entry(txid) {
-            Ok(entry) => Ok(Some(entry_to_tx(&entry))),
+            Ok(entry) => Ok(Some(entry)),
             Err(bitcoincore_rpc::Error::JsonRpc(jsonrpc::error::Error::Rpc(rpc_err)))
                 if rpc_err.code == RPC_INVALID_ADDRESS_OR_KEY =>
             {
@@ -263,17 +247,5 @@ impl From<HeaderTransportError> for jsonrpc::Error {
             HeaderTransportError::Json(e) => jsonrpc::Error::Json(e),
             e => jsonrpc::Error::Transport(Box::new(e)),
         }
-    }
-}
-
-/// Convert a raw `getmempoolentry`/`getrawmempool(true)` result into our `MempoolTx`.
-fn entry_to_tx(entry: &GetMempoolEntryResult) -> MempoolTx {
-    let vsize = entry.vsize as u32;
-    let weight = entry.weight.map(|w| w as u32).unwrap_or(vsize * 4);
-    MempoolTx {
-        vsize,
-        weight,
-        fee: entry.fees.base,
-        depends: entry.depends.clone(),
     }
 }

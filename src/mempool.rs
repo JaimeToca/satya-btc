@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::SystemTime;
 use bitcoincore_rpc::bitcoin::{Amount, Network, Txid};
+use bitcoincore_rpc::json::{GetMempoolEntryResult, GetMempoolInfoResult};
 
 #[derive(Debug, Clone)]
 pub struct MempoolTx {
@@ -9,6 +10,28 @@ pub struct MempoolTx {
     pub weight: u32,
     pub fee: Amount,
     pub depends: Vec<Txid>,
+}
+
+impl From<&GetMempoolEntryResult> for MempoolTx {
+    /// Convert a raw `getmempoolentry`/`getrawmempool(true)` result into our `MempoolTx`.
+    fn from(entry: &GetMempoolEntryResult) -> Self {
+        let vsize = entry.vsize as u32;
+        let weight = entry.weight.map(|w| w as u32).unwrap_or(vsize * 4);
+        MempoolTx {
+            vsize,
+            weight,
+            fee: entry.fees.base,
+            depends: entry.depends.clone(),
+        }
+    }
+}
+
+/// Minimum mempool-acceptance fee rate, in sat/vB.
+///
+/// `getmempoolinfo`'s `mempool_min_fee` is denominated in BTC/kvB; dividing the
+/// satoshi value by 1000 converts kvB to vB, giving sat/vB.
+pub fn min_fee_sat_vb(info: &GetMempoolInfoResult) -> f64 {
+    info.mempool_min_fee.to_sat() as f64 / 1000.0
 }
 
 #[derive(Debug)]
