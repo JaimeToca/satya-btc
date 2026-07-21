@@ -4,6 +4,7 @@ mod mempool;
 mod rpc;
 mod sync;
 mod transport;
+mod zmq;
 
 use mempool::MempoolState;
 use std::sync::{Arc, RwLock};
@@ -21,11 +22,22 @@ async fn main() -> anyhow::Result<()> {
     let network = rpc.network().await?;
     let state: mempool::SharedState = Arc::new(RwLock::new(MempoolState::new(network)));
 
-    // Channel for a future ZMQ block listener (Task 5) to wake the sync loop
-    // for an immediate tick. `wake_tx` is unused this task but must stay alive:
-    // if it were dropped, `wake_rx.recv()` would resolve immediately on a
-    // closed channel and spin the steady-state loop.
+    // Channel for the optional ZMQ block listener (Task 5) to wake the sync
+    // loop for an immediate tick. Capacity 1 so `try_send` in the listener
+    // debounces redundant block events.
     let (wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    // Opt-in: only if BTC_ZMQ_BLOCK is set do we subscribe to the node's
+    // zmqpubhashblock publisher for immediate-on-block ticks. Unset = polling
+    // only, unchanged behavior.
+    if let Some(ep) = cfg.zmq_block.clone() {
+        tracing::info!(endpoint = %ep, "starting zmq block listener");
+        tokio::spawn(zmq::spawn_block_listener(ep, wake_tx.clone()));
+    }
+
+    // Keep a sender alive for the process lifetime regardless of whether the
+    // listener runs: if the last `wake_tx` were dropped, `wake_rx.recv()` would
+    // resolve immediately on a closed channel and spin the steady-state loop.
     let _wake_tx = wake_tx;
 
     // Sync loop as a tokio task (blocking RPC calls run via spawn_blocking).
