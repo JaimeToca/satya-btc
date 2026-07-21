@@ -120,10 +120,12 @@ work). Only the RPC connection is required; everything else has a default.
 | `POLL_INTERVAL_MS`      | no                  | `2000`                  | Mempool poll interval, in milliseconds.          |
 | `RPC_TIMEOUT_SECS`      | no                  | `30`                    | Timeout for each Bitcoin Core RPC call, seconds. |
 
-\* **Authentication:** provide **either** `BTC_RPC_COOKIE_FILE` **or** both `BTC_RPC_USER`
-and `BTC_RPC_PASS`. If a cookie file is given it takes precedence; if neither is usable the
-process exits with a clear error. The cookie file is the usual choice for a local node —
-Bitcoin Core writes it to its data directory (e.g. `~/.bitcoin/.cookie` on mainnet).
+\* **Authentication:** provide `BTC_RPC_COOKIE_FILE`, **or** both `BTC_RPC_USER` and
+`BTC_RPC_PASS`, **or neither** — omit auth when the endpoint carries its credential in the URL
+(hosted providers like GetBlock, e.g. `https://go.getblock.io/<KEY>`). A cookie file takes
+precedence when set; it's the usual choice for a local node (Bitcoin Core writes it to its data
+directory, e.g. `~/.bitcoin/.cookie` on mainnet). `BTC_RPC_URL` may be `http://` (local node) or
+`https://` (hosted provider).
 
 ## Running
 
@@ -135,6 +137,9 @@ cargo build --release
 BTC_RPC_URL=http://127.0.0.1:8332 \
 BTC_RPC_COOKIE_FILE="$HOME/.bitcoin/.cookie" \
 ./target/release/btc-indexer
+
+# ...or against a hosted HTTPS provider whose key is in the URL (no auth needed)
+BTC_RPC_URL=https://go.getblock.io/<YOUR_KEY> ./target/release/btc-indexer
 ```
 
 On start it logs the address it's listening on and begins syncing. Check it:
