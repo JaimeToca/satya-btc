@@ -1,10 +1,10 @@
+use crate::config::RpcConfig;
 use bitcoincore_rpc::bitcoin::{Network, Txid};
 use bitcoincore_rpc::jsonrpc;
 use bitcoincore_rpc::{
     json::{GetMempoolEntryResult, GetMempoolInfoResult},
     Client, RpcApi,
 };
-use crate::config::RpcConfig;
 
 pub struct Rpc {
     client: Client,
@@ -18,7 +18,10 @@ const RPC_INVALID_ADDRESS_OR_KEY: i32 = -5;
 impl Rpc {
     pub fn connect(cfg: &RpcConfig) -> anyhow::Result<Self> {
         let client = crate::transport::build_client(cfg)?;
-        Ok(Self { client, cfg: cfg.clone() })
+        Ok(Self {
+            client,
+            cfg: cfg.clone(),
+        })
     }
 
     pub fn network(&mut self) -> anyhow::Result<Network> {
@@ -43,10 +46,7 @@ impl Rpc {
     }
 
     /// `Ok(None)` if the tx disappeared between listing and fetch.
-    pub fn mempool_entry(
-        &mut self,
-        txid: &Txid,
-    ) -> anyhow::Result<Option<GetMempoolEntryResult>> {
+    pub fn mempool_entry(&mut self, txid: &Txid) -> anyhow::Result<Option<GetMempoolEntryResult>> {
         self.with_reconnect(|c| match c.get_mempool_entry(txid) {
             Ok(entry) => Ok(Some(entry)),
             Err(bitcoincore_rpc::Error::JsonRpc(jsonrpc::error::Error::Rpc(rpc_err)))
@@ -61,10 +61,7 @@ impl Rpc {
     /// Runs `f` against the current client. On an auth or transport-level error, rebuilds the
     /// client once (re-reading the cookie file, in case it rotated) and retries `f` a single
     /// time before giving up.
-    fn with_reconnect<T>(
-        &mut self,
-        f: impl Fn(&Client) -> anyhow::Result<T>,
-    ) -> anyhow::Result<T> {
+    fn with_reconnect<T>(&mut self, f: impl Fn(&Client) -> anyhow::Result<T>) -> anyhow::Result<T> {
         match f(&self.client) {
             Ok(v) => Ok(v),
             Err(e) if is_reconnectable(&e) => {
@@ -81,7 +78,8 @@ impl Rpc {
 fn is_reconnectable(err: &anyhow::Error) -> bool {
     matches!(
         err.downcast_ref::<bitcoincore_rpc::Error>(),
-        Some(bitcoincore_rpc::Error::JsonRpc(jsonrpc::error::Error::Transport(_)))
-            | Some(bitcoincore_rpc::Error::Io(_))
+        Some(bitcoincore_rpc::Error::JsonRpc(
+            jsonrpc::error::Error::Transport(_)
+        )) | Some(bitcoincore_rpc::Error::Io(_))
     )
 }

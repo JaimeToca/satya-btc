@@ -1,8 +1,8 @@
+use bitcoincore_rpc::bitcoin::{Amount, Network, Txid};
+use bitcoincore_rpc::json::{GetMempoolEntryResult, GetMempoolInfoResult};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::SystemTime;
-use bitcoincore_rpc::bitcoin::{Amount, Network, Txid};
-use bitcoincore_rpc::json::{GetMempoolEntryResult, GetMempoolInfoResult};
 
 #[derive(Debug, Clone)]
 pub struct MempoolTx {
@@ -72,8 +72,8 @@ pub fn read_state(state: &SharedState) -> RwLockReadGuard<'_, MempoolState> {
 
 /// Result of diffing the node's current txid set against our cache.
 pub struct Diff {
-    pub new: Vec<Txid>,   // present at node, absent from cache -> fetch details
-    pub gone: Vec<Txid>,  // present in cache, absent at node -> remove
+    pub new: Vec<Txid>,  // present at node, absent from cache -> fetch details
+    pub gone: Vec<Txid>, // present in cache, absent at node -> remove
 }
 
 pub fn compute_diff(cache_keys: &HashSet<Txid>, node_txids: &HashSet<Txid>) -> Diff {

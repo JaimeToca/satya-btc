@@ -120,6 +120,8 @@ work). Only the RPC connection is required; everything else has a default.
 | `POLL_INTERVAL_MS`      | no                  | `2000`                  | Mempool poll interval, in milliseconds.          |
 | `RPC_TIMEOUT_SECS`      | no                  | `30`                    | Timeout for each Bitcoin Core RPC call, seconds. |
 | `BTC_RPC_HEADERS`       | no                  | —                       | Extra request headers, `Name: Value`, comma-separated (or repeat `--rpc-header`). For providers using API-key headers. |
+| `SYNC_LOG_VERBOSE`      | no                  | `false`                 | Log one INFO line per sync tick (adds/removes/size/tip). Accepts `true/false/1/0/yes/no`. |
+| `HEARTBEAT_SECS`        | no                  | `30`                    | Seconds between steady-state liveness heartbeat logs; `0` disables.       |
 
 \* **Authentication:** provide `BTC_RPC_COOKIE_FILE`, **or** both `BTC_RPC_USER` and
 `BTC_RPC_PASS`, **or neither** — omit auth when the endpoint carries its credential in the URL
@@ -177,7 +179,32 @@ curl -s http://127.0.0.1:8080/health | jq
 | `network`                | string        | Network inferred from the node (`bitcoin`, `testnet`, `signet`, `regtest`).|
 | `last_sync_ok`           | number \| null | Unix seconds of the last successful sync, or `null` if never synced — lets you tell "never synced" from "synced N seconds ago" even when `caught_up` is `false`. |
 
-Logging verbosity follows the standard `RUST_LOG` environment variable (defaults to `info`).
+### Logging
+
+Logging is structured (via `tracing`) and follows the standard `RUST_LOG` environment variable
+(defaults to `info`). By design the sync loop is quiet in steady state — it logs sync-state
+transitions, errors, and a periodic heartbeat, not one line per tick — so `info` stays readable
+in production. Turn up detail as needed:
+
+| I want to see…                        | Set                                          |
+|---------------------------------------|----------------------------------------------|
+| One line per sync tick                | `SYNC_LOG_VERBOSE=true`                       |
+| A liveness heartbeat every N seconds  | `HEARTBEAT_SECS=N` (default 30; `0` off)      |
+| Every RPC call to the node            | `RUST_LOG=info,bitcoincore_rpc=debug`         |
+| RPC calls **and** full responses      | `RUST_LOG=info,bitcoincore_rpc=trace` (loud)  |
+| HTTP request access log               | on at `info` by default (method/path/status/latency) |
+| …but silence the frequent `/health`   | `RUST_LOG=info,tower_http::trace=warn`        |
+
+HTTP requests are logged via [`tower-http`](https://docs.rs/tower-http)'s `TraceLayer` — the
+standard axum middleware — so each request emits an INFO line with method, path, status, and
+latency.
+
+> **Note on remote providers:** the sync loop fetches new transactions one at a time via
+> `getmempoolentry`. Against a **local node** that's sub-millisecond per call; against a **hosted
+> provider** each call pays network latency (100–500 ms), so a tick that must fetch hundreds of
+> new transactions can run for a long time. When that happens you'll see throttled
+> `sync in progress … fetched=X to_fetch=Y` lines. This backend is designed to run beside a local
+> node — a remote provider is fine for a quick look but will lag on a busy mainnet mempool.
 
 ## Roadmap
 

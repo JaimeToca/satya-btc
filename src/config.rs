@@ -27,6 +27,13 @@ pub struct Config {
     pub rpc: RpcConfig,
     pub http_bind: SocketAddr,
     pub poll_interval: Duration,
+    /// When true, the sync loop logs one line per tick at INFO (adds/removes/
+    /// size/tip). When false (default), it stays quiet in steady state and
+    /// only logs sync-state transitions, the heartbeat, and errors.
+    pub sync_log_verbose: bool,
+    /// How often to emit a steady-state liveness "heartbeat" log at INFO, even
+    /// when nothing changed. `Duration::ZERO` disables the heartbeat.
+    pub heartbeat: Duration,
 }
 
 #[derive(Parser)]
@@ -49,6 +56,19 @@ struct Cli {
     http_bind: SocketAddr,
     #[arg(long, env = "POLL_INTERVAL_MS", default_value_t = 2000)]
     poll_interval_ms: u64,
+    /// Log one INFO line per sync tick (adds/removes/size/tip). Accepts
+    /// true/false/1/0/yes/no. Off by default; useful when validating a new node.
+    #[arg(
+        long,
+        env = "SYNC_LOG_VERBOSE",
+        action = clap::ArgAction::Set,
+        default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
+    sync_log_verbose: bool,
+    /// Seconds between steady-state liveness heartbeat logs. `0` disables it.
+    #[arg(long, env = "HEARTBEAT_SECS", default_value_t = 30)]
+    heartbeat_secs: u64,
 }
 
 impl Config {
@@ -75,6 +95,8 @@ impl Config {
             },
             http_bind: cli.http_bind,
             poll_interval: Duration::from_millis(cli.poll_interval_ms),
+            sync_log_verbose: cli.sync_log_verbose,
+            heartbeat: Duration::from_secs(cli.heartbeat_secs),
         })
     }
 }
@@ -82,9 +104,9 @@ impl Config {
 /// Parses a single `--rpc-header`/`BTC_RPC_HEADERS` entry of the form `Name: Value`, splitting
 /// on the first `:` and trimming whitespace from both sides.
 fn parse_header(entry: &str) -> anyhow::Result<(String, String)> {
-    let colon = entry
-        .find(':')
-        .ok_or_else(|| anyhow::anyhow!("malformed --rpc-header {entry:?}: expected \"Name: Value\""))?;
+    let colon = entry.find(':').ok_or_else(|| {
+        anyhow::anyhow!("malformed --rpc-header {entry:?}: expected \"Name: Value\"")
+    })?;
     let name = entry[..colon].trim().to_string();
     let value = entry[colon + 1..].trim().to_string();
     if name.is_empty() {

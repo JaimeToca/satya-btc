@@ -1,18 +1,20 @@
 mod config;
-mod rpc;
-mod transport;
-mod mempool;
-mod sync;
 mod http;
+mod mempool;
+mod rpc;
+mod sync;
+mod transport;
 
-use std::sync::{Arc, RwLock};
 use mempool::MempoolState;
+use std::sync::{Arc, RwLock};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().with_env_filter(
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "info".into())).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
 
     let cfg = config::Config::from_env()?;
     let mut rpc = rpc::Rpc::connect(&cfg.rpc)?;
@@ -21,8 +23,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Sync loop on its own OS thread (blocking RPC client).
     let sync_state = state.clone();
-    let poll = cfg.poll_interval;
-    let sync_handle = std::thread::spawn(move || sync::run(rpc, sync_state, poll));
+    let sync_cfg = sync::SyncConfig {
+        poll_interval: cfg.poll_interval,
+        verbose: cfg.sync_log_verbose,
+        heartbeat: cfg.heartbeat,
+    };
+    let sync_handle = std::thread::spawn(move || sync::run(rpc, sync_state, sync_cfg));
 
     // sync::run only returns via panic (it's an infinite loop). Supervise the
     // thread off-runtime: if it ever ends, the process is silently frozen but

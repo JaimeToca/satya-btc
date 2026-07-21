@@ -1,7 +1,10 @@
+use crate::mempool::{read_state, SharedState};
 use axum::{extract::State, routing::get, Json, Router};
 use serde::Serialize;
 use std::time::UNIX_EPOCH;
-use crate::mempool::{read_state, SharedState};
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tower_http::LatencyUnit;
+use tracing::Level;
 
 #[derive(Serialize)]
 struct Health {
@@ -14,7 +17,22 @@ struct Health {
 }
 
 pub fn router(state: SharedState) -> Router {
-    Router::new().route("/health", get(health)).with_state(state)
+    Router::new()
+        .route("/health", get(health))
+        // Access log: one INFO line per request with method, path, status, and
+        // latency. Emitted through the same tracing subscriber as everything
+        // else, so it obeys RUST_LOG. To quiet the frequent /health poll in
+        // prod, filter the target, e.g. `RUST_LOG=info,tower_http::trace=warn`.
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(
+                    DefaultOnResponse::new()
+                        .level(Level::INFO)
+                        .latency_unit(LatencyUnit::Millis),
+                ),
+        )
+        .with_state(state)
 }
 
 async fn health(State(state): State<SharedState>) -> Json<Health> {

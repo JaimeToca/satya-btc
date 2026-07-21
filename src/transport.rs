@@ -2,10 +2,10 @@ use std::fmt;
 use std::fs;
 use std::time::Duration;
 
+use crate::config::{RpcAuth, RpcConfig};
 use bitcoincore_rpc::jsonrpc;
 use bitcoincore_rpc::jsonrpc::{Request, Response, Transport};
 use bitcoincore_rpc::Client;
-use crate::config::{RpcAuth, RpcConfig};
 
 /// Build a Bitcoin Core RPC client through a timeout-capable transport.
 ///
@@ -22,9 +22,10 @@ pub(crate) fn build_client(cfg: &RpcConfig) -> anyhow::Result<Client> {
     let user_pass = match &cfg.auth {
         Some(RpcAuth::Cookie(path)) => {
             let contents = fs::read_to_string(path)?;
-            let line = contents.lines().next().ok_or_else(|| {
-                anyhow::anyhow!("cookie file {} is empty", path.display())
-            })?;
+            let line = contents
+                .lines()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("cookie file {} is empty", path.display()))?;
             let colon = line
                 .find(':')
                 .ok_or_else(|| anyhow::anyhow!("cookie file {} is malformed", path.display()))?;

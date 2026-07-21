@@ -1,4 +1,6 @@
-use crate::mempool::{self, compute_diff, read_state, write_state, MempoolState, MempoolTx, SharedState};
+use crate::mempool::{
+    self, compute_diff, read_state, write_state, MempoolState, MempoolTx, SharedState,
+};
 use crate::rpc::Rpc;
 use std::collections::HashSet;
 use std::thread::sleep;
@@ -32,7 +34,13 @@ fn short_err(e: &anyhow::Error) -> String {
 /// `mempool_size` is only meaningful (and only logged) on a false->true
 /// transition; pass a value already in hand rather than taking a fresh lock
 /// just to read the cache length.
-fn set_synced_locked(g: &mut MempoolState, prev: &mut bool, synced: bool, reason: &str, mempool_size: usize) {
+fn set_synced_locked(
+    g: &mut MempoolState,
+    prev: &mut bool,
+    synced: bool,
+    reason: &str,
+    mempool_size: usize,
+) {
     g.caught_up = synced;
     if synced == *prev {
         return;
@@ -47,7 +55,13 @@ fn set_synced_locked(g: &mut MempoolState, prev: &mut bool, synced: bool, reason
 
 /// Like `set_synced_locked`, but acquires the write lock itself. For call
 /// sites that aren't already inside a write-lock block.
-fn set_synced(state: &SharedState, prev: &mut bool, synced: bool, reason: &str, mempool_size: usize) {
+fn set_synced(
+    state: &SharedState,
+    prev: &mut bool,
+    synced: bool,
+    reason: &str,
+    mempool_size: usize,
+) {
     let mut g = write_state(state);
     set_synced_locked(&mut g, prev, synced, reason, mempool_size);
 }
@@ -72,8 +86,38 @@ const MAX_NEW_FETCH_PER_TICK: usize = 2000;
 /// mempool download on nearly every tick.
 const RESYNC_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// Logging/timing knobs for the sync loop, grouped so `run`'s signature stays
+/// readable as they accumulate.
+#[derive(Debug, Clone, Copy)]
+pub struct SyncConfig {
+    pub poll_interval: Duration,
+    /// Log one INFO line per tick (adds/removes/size/tip). Off = quiet steady state.
+    pub verbose: bool,
+    /// Interval between steady-state liveness heartbeats. `ZERO` disables them.
+    pub heartbeat: Duration,
+}
+
+/// Emit a liveness heartbeat at INFO if `interval` has elapsed since `last`,
+/// then reset `last`. Fires regardless of sync outcome (including during an
+/// outage) so operators can see the process is still ticking. A zero interval
+/// disables it. Reads the current cache under a short lock.
+fn maybe_heartbeat(state: &SharedState, last: &mut Instant, interval: Duration) {
+    if interval.is_zero() || last.elapsed() < interval {
+        return;
+    }
+    *last = Instant::now();
+    let g = read_state(state);
+    tracing::info!(
+        mempool_size = g.txs.len(),
+        tip_height = g.tip_height,
+        caught_up = g.caught_up,
+        "heartbeat"
+    );
+}
+
 /// Blocking loop; call on a dedicated std::thread. Never returns under normal operation.
-pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
+pub fn run(mut rpc: Rpc, state: SharedState, cfg: SyncConfig) {
+    let poll_interval = cfg.poll_interval;
     // --- Startup: wait for the node's mempool to finish loading, then do an
     // initial full load before entering steady state. ---
     loop {
@@ -108,14 +152,25 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
     }
 
     // --- Steady-state loop. ---
+    let mut last_heartbeat = Instant::now();
     loop {
         sleep(poll_interval);
+        // Checked up front so the heartbeat still fires on ticks that `continue`
+        // early (RPC errors, desync cooldown) — i.e. exactly when liveness is
+        // most in doubt.
+        maybe_heartbeat(&state, &mut last_heartbeat, cfg.heartbeat);
 
         let info = match rpc.mempool_info() {
             Ok(info) => info,
             Err(e) => {
                 tracing::debug!(error = %short_err(&e), "mempool_info failed");
-                set_synced(&state, &mut caught_up_prev, false, "rpc_error:mempool_info", 0);
+                set_synced(
+                    &state,
+                    &mut caught_up_prev,
+                    false,
+                    "rpc_error:mempool_info",
+                    0,
+                );
                 continue;
             }
         };
@@ -127,7 +182,13 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
             Ok(txids) => txids.into_iter().collect(),
             Err(e) => {
                 tracing::debug!(error = %short_err(&e), "raw_mempool_txids failed");
-                set_synced(&state, &mut caught_up_prev, false, "rpc_error:raw_mempool_txids", 0);
+                set_synced(
+                    &state,
+                    &mut caught_up_prev,
+                    false,
+                    "rpc_error:raw_mempool_txids",
+                    0,
+                );
                 continue;
             }
         };
@@ -138,13 +199,16 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
             (g.txs.len(), g.txs.keys().copied().collect::<HashSet<_>>())
         };
 
-        let mass_drop = cache_len >= MASS_DROP_MIN_CACHE_SIZE
-            && node_txids.len().saturating_mul(5) < cache_len;
+        let mass_drop =
+            cache_len >= MASS_DROP_MIN_CACHE_SIZE && node_txids.len().saturating_mul(5) < cache_len;
 
         if !loaded || mass_drop {
-            let reason = if !loaded { "node_not_loaded" } else { "mass_drop" };
-            let cooling_down = last_bulk_resync
-                .is_some_and(|t| t.elapsed() < RESYNC_COOLDOWN);
+            let reason = if !loaded {
+                "node_not_loaded"
+            } else {
+                "mass_drop"
+            };
+            let cooling_down = last_bulk_resync.is_some_and(|t| t.elapsed() < RESYNC_COOLDOWN);
             if cooling_down {
                 tracing::debug!(
                     loaded,
@@ -188,10 +252,27 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
         // only fetch up to MAX_NEW_FETCH_PER_TICK per tick. Anything left
         // over stays absent from the cache, so it's still in `diff.new` (and
         // gets fetched) next tick — nothing is permanently lost.
-        let mut fetched = Vec::with_capacity(diff.new.len().min(MAX_NEW_FETCH_PER_TICK));
+        let to_fetch = diff.new.len().min(MAX_NEW_FETCH_PER_TICK);
+        let mut fetched = Vec::with_capacity(to_fetch);
         let mut fetch_errors = 0usize;
         for txid in diff.new.iter().take(MAX_NEW_FETCH_PER_TICK) {
-            match rpc.mempool_entry(txid).map(|opt| opt.map(|e| MempoolTx::from(&e))) {
+            // Against a high-latency provider a single tick's sequential fetch
+            // can run for many seconds; emit a throttled progress line (same
+            // cadence as the heartbeat) so a long tick still shows liveness
+            // instead of going dark. Resets `last_heartbeat` so the top-of-loop
+            // heartbeat keeps one steady cadence.
+            if !cfg.heartbeat.is_zero() && last_heartbeat.elapsed() >= cfg.heartbeat {
+                last_heartbeat = Instant::now();
+                tracing::info!(
+                    fetched = fetched.len(),
+                    to_fetch,
+                    "sync in progress (fetching new mempool entries)"
+                );
+            }
+            match rpc
+                .mempool_entry(txid)
+                .map(|opt| opt.map(|e| MempoolTx::from(&e)))
+            {
                 Ok(Some(tx)) => fetched.push((*txid, tx)),
                 Ok(None) => {
                     // Vanished between listing and fetch; nothing to add.
@@ -211,18 +292,35 @@ pub fn run(mut rpc: Rpc, state: SharedState, poll_interval: Duration) {
         // cache is known to be behind the node, so `/health` should say so.
         let backlog = diff.new.len() > MAX_NEW_FETCH_PER_TICK || fetch_errors > 0;
 
-        tracing::debug!(
-            new = diff.new.len(),
-            gone = diff.gone.len(),
-            fetched = fetched.len(),
-            backlog,
-            "sync tick"
-        );
-
         // Cache size after this tick's removals/inserts, computed from
         // counts already in hand rather than re-reading the cache under lock
         // just for a log field.
         let mempool_size = cache_len - diff.gone.len() + fetched.len();
+
+        // Per-tick detail: INFO when the operator asked for it (SYNC_LOG_VERBOSE),
+        // otherwise DEBUG so it's there under RUST_LOG=...=debug but silent in
+        // normal steady-state operation. Same fields either way.
+        if cfg.verbose {
+            tracing::info!(
+                new = diff.new.len(),
+                gone = diff.gone.len(),
+                fetched = fetched.len(),
+                mempool_size,
+                tip_height = ?tip_height,
+                backlog,
+                "sync tick"
+            );
+        } else {
+            tracing::debug!(
+                new = diff.new.len(),
+                gone = diff.gone.len(),
+                fetched = fetched.len(),
+                mempool_size,
+                tip_height = ?tip_height,
+                backlog,
+                "sync tick"
+            );
+        }
 
         {
             let mut g = write_state(&state);
