@@ -58,21 +58,42 @@ impl Rpc {
         spawn_blocking(move || Ok(client.get_raw_mempool_verbose()?.into_iter().collect())).await
     }
 
-    /// `Ok(None)` if the tx disappeared between listing and fetch.
-    pub async fn mempool_entry(
+    /// Fetch a single mempool entry, holding an owned semaphore permit for the
+    /// entire duration of the blocking `getmempoolentry` call.
+    ///
+    /// `Ok(None)` if the tx disappeared between listing and fetch (the node
+    /// returns `RPC_INVALID_ADDRESS_OR_KEY`, code -5).
+    ///
+    /// The permit is **moved into the `spawn_blocking` closure body**, so it is
+    /// released only when that blocking call actually completes — even if the
+    /// caller drops the returned future / the surrounding stream (e.g. on a
+    /// budget bail). This globally caps concurrent in-flight blocking entry-RPCs
+    /// at the semaphore's permit count across ticks, protecting bitcoind's
+    /// `rpcworkqueue`.
+    ///
+    /// CRITICAL: the permit is bound inside the closure (`let _permit = permit;`
+    /// below), NOT in the async frame around `spawn_blocking(...).await`. If it
+    /// were held only in the async frame, dropping the future/JoinHandle on a
+    /// budget bail would free the permit early and defeat the bound.
+    pub async fn mempool_entry_with_permit(
         &self,
         txid: &Txid,
+        permit: tokio::sync::OwnedSemaphorePermit,
     ) -> anyhow::Result<Option<GetMempoolEntryResult>> {
         let client = self.client.clone();
         let txid = *txid;
-        spawn_blocking(move || match client.get_mempool_entry(&txid) {
-            Ok(entry) => Ok(Some(entry)),
-            Err(bitcoincore_rpc::Error::JsonRpc(jsonrpc::error::Error::Rpc(rpc_err)))
-                if rpc_err.code == RPC_INVALID_ADDRESS_OR_KEY =>
-            {
-                Ok(None)
+        spawn_blocking(move || {
+            // Held until this blocking closure returns — the orphaned-work bound.
+            let _permit = permit;
+            match client.get_mempool_entry(&txid) {
+                Ok(entry) => Ok(Some(entry)),
+                Err(bitcoincore_rpc::Error::JsonRpc(jsonrpc::error::Error::Rpc(rpc_err)))
+                    if rpc_err.code == RPC_INVALID_ADDRESS_OR_KEY =>
+                {
+                    Ok(None)
+                }
+                Err(e) => Err(e.into()),
             }
-            Err(e) => Err(e.into()),
         })
         .await
     }
@@ -101,9 +122,18 @@ where
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
-        .await
-        .expect("rpc blocking task panicked")
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        // `spawn_blocking` only fails to join if the closure panicked. That's a
+        // bug we can't recover from, but log the JoinError payload first so the
+        // panic isn't swallowed silently, then take the process down (preserving
+        // the supervisor semantics: a panicked blocking task kills the process
+        // so a supervisor restarts us).
+        Err(e) => {
+            tracing::error!(error = %e, "rpc blocking task panicked");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Whether an error looks like an auth failure (e.g. rotated cookie) or a transport-level

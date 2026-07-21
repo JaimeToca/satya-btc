@@ -10,6 +10,14 @@ pub struct MempoolTx {
     pub weight: u32,
     pub fee: Amount,
     pub depends: Vec<Txid>,
+    // NOTE: the `ancestor_*`/`descendant_*` package fields below are a SNAPSHOT
+    // taken at the moment this tx was fetched from the node via
+    // `getmempoolentry`. They are NOT refreshed as related txs later enter or
+    // leave the mempool, so once a tx is cached its package totals can drift
+    // from the node's live view (e.g. a new child raises the real descendant
+    // fee/size but this cached copy stays put). Phase-3 GBT must recompute /
+    // refresh package data (ancestor/descendant fee and size) from a fresh
+    // source rather than trust these cached values as live.
     pub ancestor_fee: Amount,
     pub ancestor_vsize: u32,
     pub descendant_fee: Amount,

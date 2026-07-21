@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
 axum = "0.7"
 # Standard tower middleware for axum; `trace` gives per-request tracing spans
 # (method, path, status, latency) that flow into our existing tracing subscriber.

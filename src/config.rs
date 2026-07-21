@@ -41,7 +41,9 @@ pub struct Config {
     /// immediate recompute on new blocks. Unset = polling only.
     pub zmq_block: Option<String>,
     /// Max fetch time per tick before bailing and marking stale. Default:
-    /// 2 x POLL_INTERVAL_MS.
+    /// 2 x POLL_INTERVAL_MS. Floored at `poll_interval` so a pathologically
+    /// tiny value (e.g. `TICK_BUDGET_MS=0`) can't force a permanent backlog by
+    /// bailing after the very first result.
     pub tick_budget: Duration,
 }
 
@@ -122,7 +124,11 @@ impl Config {
             zmq_block: cli.zmq_block,
             tick_budget: Duration::from_millis(
                 cli.tick_budget_ms
-                    .unwrap_or(cli.poll_interval_ms.saturating_mul(2)),
+                    .unwrap_or(cli.poll_interval_ms.saturating_mul(2))
+                    // Floor at the poll interval so a pathologically tiny
+                    // TICK_BUDGET_MS (e.g. 0) can't bail after the first result
+                    // and wedge the sync in permanent backlog.
+                    .max(cli.poll_interval_ms),
             ),
         })
     }

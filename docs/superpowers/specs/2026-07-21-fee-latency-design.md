@@ -115,6 +115,12 @@ Node-side docs: `zmqpubhashblock=tcp://0.0.0.0:28332`, `rpcthreads`, `rpcworkque
   (`reqwest`) — out of scope.
 - Full event-driven ingest (`zmqpubsequence` + `zmqpubrawtx`) is a later ceiling;
   this phase does block-push only.
+- `MempoolTx`'s package fields (`ancestor_fee`, `ancestor_vsize`,
+  `descendant_fee`, `descendant_vsize`) are a **snapshot** taken at fetch time,
+  not a live view: they are not refreshed as related txs later enter or leave the
+  mempool, so a cached tx's package totals can drift from the node's current
+  state. Phase-3 GBT must recompute/refresh package data rather than trust these
+  cached values as live.
 
 ## Testing
 

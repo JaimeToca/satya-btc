@@ -18,8 +18,35 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = config::Config::from_env()?;
-    let rpc = rpc::Rpc::connect(&cfg.rpc)?;
-    let network = rpc.network().await?;
+    let mut rpc = rpc::Rpc::connect(&cfg.rpc)?;
+    // Bounded startup retry for the initial `network()` probe: a node restart /
+    // cookie-not-yet-readable race at startup shouldn't crash-loop the process.
+    // On a reconnectable (auth/transport) error, rebuild the client and retry a
+    // few times; give up (propagate the error) after the bound so we can't hang
+    // forever.
+    let network = {
+        const MAX_ATTEMPTS: u32 = 5;
+        let mut attempt = 1;
+        loop {
+            match rpc.network().await {
+                Ok(n) => break n,
+                Err(e) if rpc::is_reconnectable(&e) && attempt < MAX_ATTEMPTS => {
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = MAX_ATTEMPTS,
+                        error = %e,
+                        "initial network() probe failed with a reconnectable error; reconnecting and retrying"
+                    );
+                    if let Err(re) = rpc.reconnect() {
+                        tracing::warn!(error = %re, "rpc reconnect failed");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
     let state: mempool::SharedState = Arc::new(RwLock::new(MempoolState::new(network)));
 
     // Channel for the optional ZMQ block listener (Task 5) to wake the sync
