@@ -27,15 +27,24 @@ pub struct MempoolTx {
 impl From<&MempoolEntry> for MempoolTx {
     /// Convert a raw `getmempoolentry`/`getrawmempool(true)` entry into our `MempoolTx`.
     fn from(entry: &MempoolEntry) -> Self {
+        // Saturating u32 casts: these fields cross an untrusted RPC boundary, so
+        // clamp rather than silently wrap on an absurd value.
+        let vsize = u32::try_from(entry.vsize).unwrap_or(u32::MAX);
         MempoolTx {
-            vsize: entry.vsize as u32,
-            weight: entry.weight as u32,
+            vsize,
+            // `weight` was added in Core v0.19; when absent, fall back to the
+            // pre-segwit-style `vsize * 4` so a missing field doesn't fail the
+            // whole verbose-mempool decode.
+            weight: entry
+                .weight
+                .map(|w| u32::try_from(w).unwrap_or(u32::MAX))
+                .unwrap_or_else(|| vsize.saturating_mul(4)),
             fee: entry.fees.base,
             depends: entry.depends.clone(),
             ancestor_fee: entry.fees.ancestor,
-            ancestor_vsize: entry.ancestorsize as u32,
+            ancestor_vsize: u32::try_from(entry.ancestorsize).unwrap_or(u32::MAX),
             descendant_fee: entry.fees.descendant,
-            descendant_vsize: entry.descendantsize as u32,
+            descendant_vsize: u32::try_from(entry.descendantsize).unwrap_or(u32::MAX),
         }
     }
 }
