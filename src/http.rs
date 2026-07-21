@@ -1,7 +1,7 @@
 use crate::mempool::{read_state, SharedState};
 use axum::{extract::State, routing::get, Json, Router};
 use serde::Serialize;
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tower_http::LatencyUnit;
 use tracing::Level;
@@ -14,6 +14,7 @@ struct Health {
     mempool_min_fee_sat_vb: f64,
     network: String,
     last_sync_ok: Option<u64>,
+    age_secs: Option<u64>,
 }
 
 pub fn router(state: SharedState) -> Router {
@@ -41,6 +42,10 @@ async fn health(State(state): State<SharedState>) -> Json<Health> {
         .last_sync_ok
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs());
+    let age_secs = s
+        .last_sync_ok
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .map(|d| d.as_secs());
     Json(Health {
         caught_up: s.caught_up,
         mempool_size: s.txs.len(),
@@ -48,5 +53,6 @@ async fn health(State(state): State<SharedState>) -> Json<Health> {
         mempool_min_fee_sat_vb: s.mempool_min_fee_sat_vb,
         network: s.network.to_string(),
         last_sync_ok,
+        age_secs,
     })
 }

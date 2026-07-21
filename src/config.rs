@@ -27,13 +27,17 @@ pub struct Config {
     pub rpc: RpcConfig,
     pub http_bind: SocketAddr,
     pub poll_interval: Duration,
-    /// When true, the sync loop logs one line per tick at INFO (adds/removes/
-    /// size/tip). When false (default), it stays quiet in steady state and
-    /// only logs sync-state transitions, the heartbeat, and errors.
-    pub sync_log_verbose: bool,
-    /// How often to emit a steady-state liveness "heartbeat" log at INFO, even
-    /// when nothing changed. `Duration::ZERO` disables the heartbeat.
-    pub heartbeat: Duration,
+    /// Max concurrent getmempoolentry calls per tick. Bounded by node
+    /// rpcthreads (default 4) / rpcworkqueue (default 16).
+    pub fetch_concurrency: usize,
+    /// Node zmqpubhashblock endpoint (e.g. tcp://127.0.0.1:28332) for
+    /// immediate recompute on new blocks. Unset = polling only.
+    pub zmq_block: Option<String>,
+    /// Max fetch time per tick before bailing and marking stale. Default:
+    /// 2 x POLL_INTERVAL_MS. Floored at `poll_interval` so a pathologically
+    /// tiny value (e.g. `TICK_BUDGET_MS=0`) can't force a permanent backlog by
+    /// bailing after the very first result.
+    pub tick_budget: Duration,
 }
 
 #[derive(Parser)]
@@ -56,19 +60,18 @@ struct Cli {
     http_bind: SocketAddr,
     #[arg(long, env = "POLL_INTERVAL_MS", default_value_t = 2000)]
     poll_interval_ms: u64,
-    /// Log one INFO line per sync tick (adds/removes/size/tip). Accepts
-    /// true/false/1/0/yes/no. Off by default; useful when validating a new node.
-    #[arg(
-        long,
-        env = "SYNC_LOG_VERBOSE",
-        action = clap::ArgAction::Set,
-        default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
-    )]
-    sync_log_verbose: bool,
-    /// Seconds between steady-state liveness heartbeat logs. `0` disables it.
-    #[arg(long, env = "HEARTBEAT_SECS", default_value_t = 30)]
-    heartbeat_secs: u64,
+    /// Max concurrent getmempoolentry calls per tick. Bounded by node
+    /// rpcthreads (default 4) / rpcworkqueue (default 16).
+    #[arg(long, env = "FETCH_CONCURRENCY", default_value_t = 10)]
+    fetch_concurrency: usize,
+    /// Node zmqpubhashblock endpoint (e.g. tcp://127.0.0.1:28332) for
+    /// immediate recompute on new blocks. Unset = polling only.
+    #[arg(long, env = "BTC_ZMQ_BLOCK")]
+    zmq_block: Option<String>,
+    /// Max fetch time per tick before bailing and marking stale. Default:
+    /// 2 x POLL_INTERVAL_MS.
+    #[arg(long, env = "TICK_BUDGET_MS")]
+    tick_budget_ms: Option<u64>,
 }
 
 impl Config {
@@ -95,8 +98,16 @@ impl Config {
             },
             http_bind: cli.http_bind,
             poll_interval: Duration::from_millis(cli.poll_interval_ms),
-            sync_log_verbose: cli.sync_log_verbose,
-            heartbeat: Duration::from_secs(cli.heartbeat_secs),
+            fetch_concurrency: cli.fetch_concurrency.max(1),
+            zmq_block: cli.zmq_block,
+            tick_budget: Duration::from_millis(
+                cli.tick_budget_ms
+                    .unwrap_or(cli.poll_interval_ms.saturating_mul(2))
+                    // Floor at the poll interval so a pathologically tiny
+                    // TICK_BUDGET_MS (e.g. 0) can't bail after the first result
+                    // and wedge the sync in permanent backlog.
+                    .max(cli.poll_interval_ms),
+            ),
         })
     }
 }

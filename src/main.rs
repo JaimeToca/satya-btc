@@ -4,6 +4,7 @@ mod mempool;
 mod rpc;
 mod sync;
 mod transport;
+mod zmq;
 
 use mempool::MempoolState;
 use std::sync::{Arc, RwLock};
@@ -18,25 +19,70 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = config::Config::from_env()?;
     let mut rpc = rpc::Rpc::connect(&cfg.rpc)?;
-    let network = rpc.network()?;
+    // Bounded startup retry for the initial `network()` probe: a node restart /
+    // cookie-not-yet-readable race at startup shouldn't crash-loop the process.
+    // On a reconnectable (auth/transport) error, rebuild the client and retry a
+    // few times; give up (propagate the error) after the bound so we can't hang
+    // forever.
+    let network = {
+        const MAX_ATTEMPTS: u32 = 5;
+        let mut attempt = 1;
+        loop {
+            match rpc.network().await {
+                Ok(n) => break n,
+                Err(e) if rpc::is_reconnectable(&e) && attempt < MAX_ATTEMPTS => {
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = MAX_ATTEMPTS,
+                        error = %e,
+                        "initial network() probe failed with a reconnectable error; reconnecting and retrying"
+                    );
+                    if let Err(re) = rpc.reconnect() {
+                        tracing::warn!(error = %re, "rpc reconnect failed");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
     let state: mempool::SharedState = Arc::new(RwLock::new(MempoolState::new(network)));
 
-    // Sync loop on its own OS thread (blocking RPC client).
+    // Channel for the optional ZMQ block listener (Task 5) to wake the sync
+    // loop for an immediate tick. Capacity 1 so `try_send` in the listener
+    // debounces redundant block events.
+    let (wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    // Opt-in: only if BTC_ZMQ_BLOCK is set do we subscribe to the node's
+    // zmqpubhashblock publisher for immediate-on-block ticks. Unset = polling
+    // only, unchanged behavior.
+    if let Some(ep) = cfg.zmq_block.clone() {
+        tracing::info!(endpoint = %ep, "starting zmq block listener");
+        tokio::spawn(zmq::spawn_block_listener(ep, wake_tx.clone()));
+    }
+
+    // Keep a sender alive for the process lifetime regardless of whether the
+    // listener runs: if the last `wake_tx` were dropped, `wake_rx.recv()` would
+    // resolve immediately on a closed channel and spin the steady-state loop.
+    let _wake_tx = wake_tx;
+
+    // Sync loop as a tokio task (blocking RPC calls run via spawn_blocking).
     let sync_state = state.clone();
     let sync_cfg = sync::SyncConfig {
         poll_interval: cfg.poll_interval,
-        verbose: cfg.sync_log_verbose,
-        heartbeat: cfg.heartbeat,
+        fetch_concurrency: cfg.fetch_concurrency,
+        tick_budget: cfg.tick_budget,
     };
-    let sync_handle = std::thread::spawn(move || sync::run(rpc, sync_state, sync_cfg));
+    let sync_handle = tokio::spawn(sync::run(rpc, sync_state, sync_cfg, wake_rx));
 
     // sync::run only returns via panic (it's an infinite loop). Supervise the
-    // thread off-runtime: if it ever ends, the process is silently frozen but
-    // still reporting `/health`, which is worse than a clean exit. Log and
-    // terminate so a process supervisor (systemd/docker) restarts us.
+    // task: if it ever ends, the process is silently frozen but still reporting
+    // `/health`, which is worse than a clean exit. Log and terminate so a
+    // process supervisor (systemd/docker) restarts us.
     tokio::spawn(async move {
-        let _ = tokio::task::spawn_blocking(move || sync_handle.join()).await;
-        tracing::error!("sync thread exited unexpectedly; shutting down");
+        let _ = sync_handle.await;
+        tracing::error!("sync task exited unexpectedly; shutting down");
         std::process::exit(1);
     });
 

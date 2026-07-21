@@ -1,10 +1,14 @@
 use crate::mempool::{
     self, compute_diff, read_state, write_state, MempoolState, MempoolTx, SharedState,
 };
-use crate::rpc::Rpc;
+use crate::rpc::{self, Rpc};
+use bitcoincore_rpc::bitcoin::Txid;
+use futures::stream::{self, StreamExt};
+use futures::FutureExt;
 use std::collections::HashSet;
-use std::thread::sleep;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::Semaphore;
 
 /// Maximum length of a formatted error string included in a log line, so a
 /// huge (or secret-bearing) provider error body can't blow up the logs.
@@ -91,47 +95,44 @@ const RESYNC_COOLDOWN: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, Copy)]
 pub struct SyncConfig {
     pub poll_interval: Duration,
-    /// Log one INFO line per tick (adds/removes/size/tip). Off = quiet steady state.
-    pub verbose: bool,
-    /// Interval between steady-state liveness heartbeats. `ZERO` disables them.
-    pub heartbeat: Duration,
+    /// Max concurrent `getmempoolentry` calls per tick (via `buffer_unordered`).
+    pub fetch_concurrency: usize,
+    /// Max fetch time per tick before bailing and marking the state stale
+    /// (`caught_up = false`); the remainder is retried on the next tick.
+    pub tick_budget: Duration,
 }
 
-/// Emit a liveness heartbeat at INFO if `interval` has elapsed since `last`,
-/// then reset `last`. Fires regardless of sync outcome (including during an
-/// outage) so operators can see the process is still ticking. A zero interval
-/// disables it. Reads the current cache under a short lock.
-fn maybe_heartbeat(state: &SharedState, last: &mut Instant, interval: Duration) {
-    if interval.is_zero() || last.elapsed() < interval {
-        return;
-    }
-    *last = Instant::now();
-    let g = read_state(state);
-    tracing::info!(
-        mempool_size = g.txs.len(),
-        tip_height = g.tip_height,
-        caught_up = g.caught_up,
-        "heartbeat"
-    );
-}
-
-/// Blocking loop; call on a dedicated std::thread. Never returns under normal operation.
-pub fn run(mut rpc: Rpc, state: SharedState, cfg: SyncConfig) {
+/// Async sync loop; spawn on the tokio runtime. Never returns under normal
+/// operation. `wake_rx` lets a future ZMQ block event (Task 5) trigger an
+/// immediate steady-state tick instead of waiting out the poll interval.
+pub async fn run(
+    mut rpc: Rpc,
+    state: SharedState,
+    cfg: SyncConfig,
+    mut wake_rx: tokio::sync::mpsc::Receiver<()>,
+) {
     let poll_interval = cfg.poll_interval;
     // --- Startup: wait for the node's mempool to finish loading, then do an
     // initial full load before entering steady state. ---
     loop {
-        match rpc.mempool_info() {
+        match rpc.mempool_info().await {
             // Older nodes don't report `loaded` at all; treat that as loaded.
             Ok(info) if info.loaded.unwrap_or(true) => break,
             Ok(_) => {
                 tracing::info!("waiting for node mempool to finish loading");
             }
             Err(e) => {
-                tracing::debug!(error = %short_err(&e), "error checking mempool_info during startup");
+                tracing::warn!(error = %short_err(&e), "error checking mempool_info during startup");
+                // A node restart rotates the cookie; rebuild the client before
+                // the retry sleep so we don't spin on 401 forever at startup.
+                if rpc::is_reconnectable(&e) {
+                    if let Err(re) = rpc.reconnect() {
+                        tracing::warn!(error = %short_err(&re), "rpc reconnect failed");
+                    }
+                }
             }
         }
-        sleep(poll_interval);
+        tokio::time::sleep(poll_interval).await;
     }
 
     // Tracks the previously-logged `caught_up` value so we only emit a
@@ -142,28 +143,41 @@ pub fn run(mut rpc: Rpc, state: SharedState, cfg: SyncConfig) {
 
     let mut last_bulk_resync: Option<Instant>;
     loop {
-        if let Some(count) = bulk_resync(&mut rpc, &state) {
+        if let Some(count) = bulk_resync(&mut rpc, &state).await {
             last_bulk_resync = Some(Instant::now());
             set_synced(&state, &mut caught_up_prev, true, "", count);
             break;
         }
         tracing::warn!("initial bulk resync failed; retrying");
-        sleep(poll_interval);
+        tokio::time::sleep(poll_interval).await;
     }
 
     // --- Steady-state loop. ---
-    let mut last_heartbeat = Instant::now();
+    // Shared across ALL ticks: caps concurrent in-flight blocking
+    // `getmempoolentry` calls at `fetch_concurrency` globally, not just per
+    // tick. Each fetch acquires an owned permit that's moved into its
+    // `spawn_blocking` closure and released only when that blocking RPC
+    // completes — so work orphaned by a budget-bail `break` (whose futures are
+    // dropped) still holds its permit until the underlying RPC finishes,
+    // protecting bitcoind's `rpcworkqueue` from a pile-up across ticks.
+    let fetch_semaphore = Arc::new(Semaphore::new(cfg.fetch_concurrency));
     loop {
-        sleep(poll_interval);
-        // Checked up front so the heartbeat still fires on ticks that `continue`
-        // early (RPC errors, desync cooldown) — i.e. exactly when liveness is
-        // most in doubt.
-        maybe_heartbeat(&state, &mut last_heartbeat, cfg.heartbeat);
+        // Interruptible wait: either the poll interval elapses, or a ZMQ block
+        // event wakes us early (wire-up in Task 5).
+        tokio::select! {
+            _ = tokio::time::sleep(poll_interval) => {}
+            _ = wake_rx.recv() => {}
+        }
 
-        let info = match rpc.mempool_info() {
+        let info = match rpc.mempool_info().await {
             Ok(info) => info,
             Err(e) => {
-                tracing::debug!(error = %short_err(&e), "mempool_info failed");
+                tracing::warn!(error = %short_err(&e), "mempool_info failed");
+                if rpc::is_reconnectable(&e) {
+                    if let Err(re) = rpc.reconnect() {
+                        tracing::warn!(error = %short_err(&re), "rpc reconnect failed");
+                    }
+                }
                 set_synced(
                     &state,
                     &mut caught_up_prev,
@@ -178,10 +192,15 @@ pub fn run(mut rpc: Rpc, state: SharedState, cfg: SyncConfig) {
         let loaded = info.loaded.unwrap_or(true);
         let min_fee_sat_vb = mempool::min_fee_sat_vb(&info);
 
-        let node_txids: HashSet<_> = match rpc.raw_mempool_txids() {
+        let node_txids: HashSet<_> = match rpc.raw_mempool_txids().await {
             Ok(txids) => txids.into_iter().collect(),
             Err(e) => {
-                tracing::debug!(error = %short_err(&e), "raw_mempool_txids failed");
+                tracing::warn!(error = %short_err(&e), "raw_mempool_txids failed");
+                if rpc::is_reconnectable(&e) {
+                    if let Err(re) = rpc.reconnect() {
+                        tracing::warn!(error = %short_err(&re), "rpc reconnect failed");
+                    }
+                }
                 set_synced(
                     &state,
                     &mut caught_up_prev,
@@ -228,7 +247,7 @@ pub fn run(mut rpc: Rpc, state: SharedState, cfg: SyncConfig) {
                 "mempool desync detected (node reload or mass drop); resyncing from scratch"
             );
             last_bulk_resync = Some(Instant::now());
-            match bulk_resync(&mut rpc, &state) {
+            match bulk_resync(&mut rpc, &state).await {
                 Some(count) => set_synced(&state, &mut caught_up_prev, true, "", count),
                 None => set_synced(&state, &mut caught_up_prev, false, "resync_failed", 0),
             }
@@ -247,80 +266,107 @@ pub fn run(mut rpc: Rpc, state: SharedState, cfg: SyncConfig) {
             }
         }
 
-        // Fetch adds best-effort and bounded: a single failed fetch doesn't
-        // abort the batch or discard txs already fetched this tick, and we
-        // only fetch up to MAX_NEW_FETCH_PER_TICK per tick. Anything left
-        // over stays absent from the cache, so it's still in `diff.new` (and
-        // gets fetched) next tick — nothing is permanently lost.
-        let to_fetch = diff.new.len().min(MAX_NEW_FETCH_PER_TICK);
+        // Fetch adds best-effort, bounded, and concurrent: a single failed
+        // fetch doesn't abort the batch or discard txs already fetched this
+        // tick; we fetch up to MAX_NEW_FETCH_PER_TICK per tick with at most
+        // `cfg.fetch_concurrency` calls in flight (via `buffer_unordered`); and
+        // we stop consuming once this tick's fetch has run past `cfg.tick_budget`.
+        // Anything left over (capped, dropped in-flight on budget bail, or
+        // errored) stays absent from the cache, so it's still in `diff.new`
+        // (and gets fetched) next tick — nothing is permanently lost.
+        let candidates: Vec<Txid> = diff.new.iter().take(MAX_NEW_FETCH_PER_TICK).copied().collect();
+        let to_fetch = candidates.len();
+        let fetch_start = Instant::now();
         let mut fetched = Vec::with_capacity(to_fetch);
         let mut fetch_errors = 0usize;
-        for txid in diff.new.iter().take(MAX_NEW_FETCH_PER_TICK) {
-            // Against a high-latency provider a single tick's sequential fetch
-            // can run for many seconds; emit a throttled progress line (same
-            // cadence as the heartbeat) so a long tick still shows liveness
-            // instead of going dark. Resets `last_heartbeat` so the top-of-loop
-            // heartbeat keeps one steady cadence.
-            if !cfg.heartbeat.is_zero() && last_heartbeat.elapsed() >= cfg.heartbeat {
-                last_heartbeat = Instant::now();
-                tracing::info!(
-                    fetched = fetched.len(),
-                    to_fetch,
-                    "sync in progress (fetching new mempool entries)"
-                );
-            }
-            match rpc
-                .mempool_entry(txid)
-                .map(|opt| opt.map(|e| MempoolTx::from(&e)))
-            {
-                Ok(Some(tx)) => fetched.push((*txid, tx)),
+        // Count of candidates whose fetch fully resolved this tick — incremented
+        // for EVERY processed result including `Ok(None)` (vanished) and `Err`.
+        // `budget_exceeded` is computed from this after the loop: a tick is only
+        // "stale" if candidates remain unresolved when we stopped, so a tick
+        // that resolved every candidate but happened to cross the wall-clock
+        // budget on the last item is NOT marked stale.
+        let mut resolved = 0usize;
+        // Per-result processing, shared between the main consume loop and the
+        // budget-bail drain below so the Ok(Some)/Ok(None)/Err handling can't
+        // drift between the two.
+        let process = |txid: Txid,
+                           res: anyhow::Result<Option<MempoolTx>>,
+                           fetched: &mut Vec<(Txid, MempoolTx)>,
+                           fetch_errors: &mut usize,
+                           resolved: &mut usize| {
+            *resolved += 1;
+            match res {
+                Ok(Some(tx)) => fetched.push((txid, tx)),
                 Ok(None) => {
                     // Vanished between listing and fetch; nothing to add.
                 }
                 Err(e) => {
-                    fetch_errors += 1;
+                    *fetch_errors += 1;
                     tracing::debug!(error = %short_err(&e), %txid, "mempool_entry fetch failed; will retry next tick");
                 }
             }
+        };
+        let mut results = stream::iter(candidates.into_iter())
+            .map(|txid| {
+                let rpc = rpc.clone();
+                let sem = fetch_semaphore.clone();
+                async move {
+                    // Acquire a permit (bounds concurrency globally across
+                    // ticks). It's moved into the blocking closure inside
+                    // `mempool_entry_with_permit` and released only when the RPC
+                    // completes — so a budget-bail that drops this future still
+                    // holds the permit until the orphaned RPC finishes.
+                    let permit = match sem.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        // The semaphore is never closed for the process lifetime;
+                        // treat a closed semaphore as a fetch error rather than
+                        // panicking.
+                        Err(e) => return (txid, Err(anyhow::Error::new(e))),
+                    };
+                    (
+                        txid,
+                        rpc.mempool_entry_with_permit(&txid, permit)
+                            .await
+                            .map(|opt| opt.map(|e| MempoolTx::from(&e))),
+                    )
+                }
+            })
+            .buffer_unordered(cfg.fetch_concurrency);
+        while let Some((txid, res)) = results.next().await {
+            process(txid, res, &mut fetched, &mut fetch_errors, &mut resolved);
+            // Time-based bail: stop consuming once this tick's fetch has run
+            // past budget. Before stopping, drain any results that are ALREADY
+            // ready without awaiting new work (`now_or_never`), so completed
+            // fetches this tick aren't thrown away just because we crossed the
+            // budget. In-flight (not-yet-ready) futures are dropped when we
+            // `break`; their permits are still held inside their spawn_blocking
+            // closures until those RPCs finish, and the txids reappear in next
+            // tick's `diff.new`.
+            if fetch_start.elapsed() > cfg.tick_budget {
+                while let Some(Some((txid, res))) = results.next().now_or_never() {
+                    process(txid, res, &mut fetched, &mut fetch_errors, &mut resolved);
+                }
+                break;
+            }
         }
+        // Stale only if candidates remain unresolved after the (drained) stop —
+        // NOT merely because wall-clock time crossed the budget.
+        let budget_exceeded = resolved < to_fetch;
 
-        let tip_height = rpc.tip_height().ok();
+        let tip_height = rpc.tip_height().await.ok();
 
         // Only promote to "caught up" when this tick fully resolved the
-        // node's new-txid list (didn't hit the per-tick cap, and every fetch
-        // either succeeded or the tx had already vanished). Otherwise the
-        // cache is known to be behind the node, so `/health` should say so.
-        let backlog = diff.new.len() > MAX_NEW_FETCH_PER_TICK || fetch_errors > 0;
+        // node's new-txid list (didn't hit the per-tick cap, didn't bail on
+        // the time budget, and every fetch either succeeded or the tx had
+        // already vanished). Otherwise the cache is known to be behind the
+        // node, so `/health` should say so.
+        let backlog =
+            diff.new.len() > MAX_NEW_FETCH_PER_TICK || fetch_errors > 0 || budget_exceeded;
 
         // Cache size after this tick's removals/inserts, computed from
         // counts already in hand rather than re-reading the cache under lock
         // just for a log field.
         let mempool_size = cache_len - diff.gone.len() + fetched.len();
-
-        // Per-tick detail: INFO when the operator asked for it (SYNC_LOG_VERBOSE),
-        // otherwise DEBUG so it's there under RUST_LOG=...=debug but silent in
-        // normal steady-state operation. Same fields either way.
-        if cfg.verbose {
-            tracing::info!(
-                new = diff.new.len(),
-                gone = diff.gone.len(),
-                fetched = fetched.len(),
-                mempool_size,
-                tip_height = ?tip_height,
-                backlog,
-                "sync tick"
-            );
-        } else {
-            tracing::debug!(
-                new = diff.new.len(),
-                gone = diff.gone.len(),
-                fetched = fetched.len(),
-                mempool_size,
-                tip_height = ?tip_height,
-                backlog,
-                "sync tick"
-            );
-        }
 
         {
             let mut g = write_state(&state);
@@ -346,25 +392,40 @@ pub fn run(mut rpc: Rpc, state: SharedState, cfg: SyncConfig) {
 /// true`, `last_sync_ok` refreshed), where `count` is the number of txs
 /// loaded, or `None` on failure (state left untouched by this call; caller
 /// decides how to mark staleness).
-fn bulk_resync(rpc: &mut Rpc, state: &SharedState) -> Option<usize> {
-    let entries = match rpc.raw_mempool_verbose() {
+async fn bulk_resync(rpc: &mut Rpc, state: &SharedState) -> Option<usize> {
+    // On a reconnectable (auth/transport) error, rebuild the client before
+    // bailing so the NEXT resync attempt uses a fresh connection / re-read
+    // cookie. A node restart empties the mempool (triggering a mass-drop
+    // resync) AND rotates the cookie, so without this both the initial
+    // bulk-load loop and steady-state resyncs would wedge on 401 forever.
+    let reconnect_if_needed = |rpc: &mut Rpc, e: &anyhow::Error| {
+        if rpc::is_reconnectable(e) {
+            if let Err(re) = rpc.reconnect() {
+                tracing::warn!(error = %short_err(&re), "rpc reconnect failed");
+            }
+        }
+    };
+    let entries = match rpc.raw_mempool_verbose().await {
         Ok(entries) => entries,
         Err(e) => {
-            tracing::debug!(error = %short_err(&e), "raw_mempool_verbose failed during bulk resync");
+            tracing::warn!(error = %short_err(&e), "raw_mempool_verbose failed during bulk resync");
+            reconnect_if_needed(rpc, &e);
             return None;
         }
     };
-    let info = match rpc.mempool_info() {
+    let info = match rpc.mempool_info().await {
         Ok(info) => info,
         Err(e) => {
-            tracing::debug!(error = %short_err(&e), "mempool_info failed during bulk resync");
+            tracing::warn!(error = %short_err(&e), "mempool_info failed during bulk resync");
+            reconnect_if_needed(rpc, &e);
             return None;
         }
     };
-    let tip_height = match rpc.tip_height() {
+    let tip_height = match rpc.tip_height().await {
         Ok(h) => h,
         Err(e) => {
-            tracing::debug!(error = %short_err(&e), "tip_height failed during bulk resync");
+            tracing::warn!(error = %short_err(&e), "tip_height failed during bulk resync");
+            reconnect_if_needed(rpc, &e);
             return None;
         }
     };
