@@ -39,31 +39,36 @@ tokio::select! {
 }
 ```
 
-The blocking `bitcoincore-rpc` client stays. Individual RPCs run via
-`tokio::task::spawn_blocking`. The supervisor in `main.rs` (exit-on-death) is
+The RPC client is a native-async `reqwest`-based `Rpc` (each call is a real
+`async fn` awaited directly on the runtime — no `spawn_blocking`, no blocking
+`bitcoincore-rpc` client). The supervisor in `main.rs` (exit-on-death) is
 preserved: if the sync task ends, log and `process::exit(1)`.
 
 ### 2. Concurrent fetch (configurable, default 10)
 
-Share the client as `Arc<Client>` (it is `Send + Sync`; `minreq` opens a fresh
-connection per call so concurrent calls don't collide). Fan the per-tick new-txid
-fetch out with bounded concurrency:
+The `Rpc` handle is cheaply `Clone` (an inner `reqwest::Client` clones as a
+handle onto a shared connection pool; it is `Send + Sync`). Fan the per-tick
+new-txid fetch out with bounded concurrency, cloning the handle per future and
+awaiting each call directly:
 
 ```rust
-let results = stream::iter(new_txids)
-    .map(|txid| { let c = client.clone();
-        tokio::task::spawn_blocking(move || c.get_mempool_entry(&txid)) })
-    .buffer_unordered(fetch_concurrency)     // FETCH_CONCURRENCY, default 10
-    .collect::<Vec<_>>().await;
+let mut results = stream::iter(new_txids)
+    .map(|txid| { let rpc = rpc.clone();
+        async move { (txid, rpc.mempool_entry(&txid).await) } })
+    .buffer_unordered(fetch_concurrency);    // FETCH_CONCURRENCY, default 10
 ```
 
 Best-effort semantics preserved: a single failed fetch doesn't abort the batch;
-failures still flip `caught_up=false` (backlog). `MAX_NEW_FETCH_PER_TICK` cap stays.
+failures still flip `caught_up=false` (backlog). `MAX_NEW_FETCH_PER_TICK` cap
+stays. Because these are real async futures over `reqwest`, dropping the stream
+on a budget-bail truly **cancels** in-flight requests (cancel-on-drop), so no
+orphaned work is left running.
 
-**Reconnect model change:** a shared `Arc<Client>` can't be rebuilt in place per
-call. Since `minreq` reconnects per call, a transient failure just fails that
-fetch and the next call reconnects. Cookie rotation is handled at the loop level
-(rebuild the Arc between ticks on a persistent auth error), not per-call.
+**Reconnect model:** the shared `reqwest`-based `Rpc` isn't rebuilt per call. A
+transient fetch failure just fails that fetch (retried next tick). Cookie
+rotation is handled at the loop level — on a reconnectable (auth/transport)
+error the loop calls `rpc.reconnect()` to rebuild the client in place — not
+per-call.
 
 ### 3. ZMQ block subscription (`zmqpubhashblock`)
 
@@ -110,9 +115,9 @@ Node-side docs: `zmqpubhashblock=tcp://0.0.0.0:28332`, `rpcthreads`, `rpcworkque
 
 ## Known limitations (documented, not fixed here)
 
-- `minreq` has no keep-alive: each RPC is a fresh TCP(+TLS) connection. Concurrency
-  still massively beats sequential; connection pooling would need an async client
-  (`reqwest`) — out of scope.
+- The RPC client is `reqwest`, which keeps a connection pool with keep-alive, so
+  concurrent and back-to-back calls reuse connections rather than opening a fresh
+  TCP(+TLS) connection each time.
 - Full event-driven ingest (`zmqpubsequence` + `zmqpubrawtx`) is a later ceiling;
   this phase does block-push only.
 - `MempoolTx`'s package fields (`ancestor_fee`, `ancestor_vsize`,
