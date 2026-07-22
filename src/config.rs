@@ -38,7 +38,7 @@ pub struct Config {
 }
 
 #[derive(Parser)]
-#[command(name = "btc-indexer")]
+#[command(name = "satya")]
 struct Cli {
     #[arg(long, env = "BTC_RPC_URL", default_value = "http://127.0.0.1:8332")]
     rpc_url: String,

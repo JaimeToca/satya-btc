@@ -1,6 +1,6 @@
 # The sync loop, explained (for a new dev)
 
-btc-indexer keeps an in-memory copy of the Bitcoin mempool in sync with a node,
+Satya keeps an in-memory copy of the Bitcoin mempool in sync with a node,
 checked every ~2 seconds. Transaction IDs are shortened to `a`, `b`, `c`… here
 (real ones are 64-char hex).
 

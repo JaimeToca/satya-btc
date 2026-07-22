@@ -1,4 +1,6 @@
-# btc-indexer
+# Satya
+
+> **Satya** (Sanskrit: truth) - the true, live fee your own node sees.
 
 A lightweight, self-hostable Rust backend that keeps an accurate, always-current
 in-memory view of the Bitcoin mempool — synced directly from your own Bitcoin Core
@@ -14,7 +16,7 @@ goal. See the [Roadmap](#5-roadmap).
 
 ## 1. Project description
 
-btc-indexer connects to a Bitcoin Core node over JSON-RPC and maintains a faithful,
+Satya connects to a Bitcoin Core node over JSON-RPC and maintains a faithful,
 continuously-updated copy of the node's mempool in memory. It exposes that state over a
 small read-only HTTP API. It is deliberately minimal: a single process that talks only
 to your node, with no external dependencies to operate.
@@ -48,7 +50,7 @@ does, and read the fee tiers off that simulation. That is what mempool.space doe
 its backend is a large, multi-service system (explorer, analytics, mining dashboards, a
 database, Redis, multiple node backends).
 
-**btc-indexer is the lightweight version of just the fee-estimation core.** And because a
+**Satya is the lightweight version of just the fee-estimation core.** And because a
 fee estimate is only ever as good as the **freshness and completeness** of the mempool it
 is computed from, keeping that view current — even at a block boundary, even under load —
 is a first-class concern of this project, not an afterthought.
@@ -186,10 +188,10 @@ cargo build --release            # or: just release
 # Run against a local node using cookie auth
 BTC_RPC_URL=http://127.0.0.1:8332 \
 BTC_RPC_COOKIE_FILE="$HOME/.bitcoin/.cookie" \
-./target/release/btc-indexer
+./target/release/satya
 
 # ...or against a hosted HTTPS provider whose key is in the URL (no auth needed)
-BTC_RPC_URL=https://go.getblock.io/<YOUR_KEY> ./target/release/btc-indexer
+BTC_RPC_URL=https://go.getblock.io/<YOUR_KEY> ./target/release/satya
 ```
 
 Or copy `.env.example` to `.env` (gitignored) and run `just run`, which loads it
@@ -257,7 +259,7 @@ real problem is visible without turning on debug logging.
 
 | I want to see…                        | Set                                          |
 |---------------------------------------|----------------------------------------------|
-| Per-tx fetch failures + desync detail | `RUST_LOG=info,btc_indexer::sync=debug`       |
+| Per-tx fetch failures + desync detail | `RUST_LOG=info,satya::sync=debug`       |
 | HTTP request access log               | on at `info` by default (method/path/status/latency) |
 | …but silence the frequent `/health`   | `RUST_LOG=info,tower_http::trace=warn`        |
 

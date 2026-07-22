@@ -1,4 +1,4 @@
-# Runs btc-indexer against a Bitcoin Core node.
+# Runs satya against a Bitcoin Core node.
 #
 # The node is NOT part of this compose file — point the indexer at your existing
 # node via BTC_RPC_URL. Auth is either a mounted cookie file (default below) or
@@ -11,7 +11,7 @@
 # panics the process exits, and the container is restarted automatically.
 
 services:
-  btc-indexer:
+  satya:
     build: .
     ports:
       - "8080:8080"

@@ -17,7 +17,7 @@ RUN touch src/main.rs && cargo build --release
 FROM debian:bookworm-slim AS runtime
 # Non-root user.
 RUN useradd --system --uid 10001 --user-group app
-COPY --from=builder /app/target/release/btc-indexer /usr/local/bin/btc-indexer
+COPY --from=builder /app/target/release/satya /usr/local/bin/satya
 USER app
 
 # Bind to all interfaces inside the container (the app defaults to 127.0.0.1).
@@ -25,4 +25,4 @@ ENV HTTP_BIND=0.0.0.0:8080 \
     RUST_LOG=info
 EXPOSE 8080
 
-ENTRYPOINT ["btc-indexer"]
+ENTRYPOINT ["satya"]
