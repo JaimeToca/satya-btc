@@ -26,6 +26,10 @@ check:
 clippy:
     cargo clippy --all-targets
 
+# Run unit tests
+test:
+    cargo test
+
 # Format the code
 fmt:
     cargo fmt
