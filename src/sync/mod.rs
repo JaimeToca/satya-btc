@@ -127,15 +127,6 @@ struct FetchBatchResult {
     /// True if we stopped before resolving every attempted candidate (budget
     /// bail with in-flight work dropped).
     incomplete: bool,
-    /// Candidates whose fetch fully resolved this tick (Ok(Some)/Ok(None)/Err).
-    /// Retained on the result for diagnostics/tests even though the caller
-    /// derives staleness from `incomplete` alone.
-    #[allow(dead_code)]
-    resolved: usize,
-    /// Candidates we attempted (post-cap). Retained for the same reason as
-    /// `resolved`.
-    #[allow(dead_code)]
-    attempted: usize,
 }
 
 /// Async sync loop; spawn on the tokio runtime. Never returns under normal
@@ -455,8 +446,6 @@ async fn fetch_new_entries(
         fetched,
         fetch_errors,
         incomplete,
-        resolved,
-        attempted,
     }
 }
 
