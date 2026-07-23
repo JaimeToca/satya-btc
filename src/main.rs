@@ -2,6 +2,8 @@ mod config;
 mod http;
 mod mempool;
 mod rpc;
+#[cfg(feature = "simulation")]
+mod sim;
 mod sync;
 mod zmq;
 
