@@ -8,6 +8,19 @@ copy of the mempool, synced directly from your node, and (the destination of the
 project) simulates the next few blocks the way a miner would to read fee tiers
 off that simulation. One static binary. No database, no Redis, no explorer.
 
+## Contents
+
+- [Why Satya exists](#why-satya-exists)
+  - [Inspired by mempool.space, but not a clone of it](#inspired-by-mempoolspace-but-not-a-clone-of-it)
+- [System design](#system-design)
+- [Building the mempool](#building-the-mempool)
+- [Talking to the node: the JSON-RPC transport](#talking-to-the-node-the-json-rpc-transport)
+- [Estimating fees by simulating the next blocks](#estimating-fees-by-simulating-the-next-blocks-the-next-thing-to-build)
+- [Why your own node](#why-your-own-node-and-how-it-shapes-accuracy)
+- [Deployment](#deployment)
+- [Engineering notes](#engineering-notes)
+- [License](#license)
+
 ---
 
 ## Why Satya exists
@@ -30,16 +43,29 @@ There are two common ways to answer it, and both are unsatisfying:
 The accurate, trustless way is to **simulate the next blocks from the *live*
 mempool the way a miner does** — rank transactions by their real, CPFP-aware
 effective fee rate, pack them into projected blocks under the real weight limit,
-and read the fee tiers off the boundaries. That is precisely what
-[mempool.space](https://mempool.space) does.
+and read the fee tiers off the boundaries.
 
-**But Satya is not a re-implementation of mempool.space.** That project is a
-large, multi-service **block explorer**: block/address explorer, analytics,
-mining dashboards, Lightning, plus a database, Redis, and multiple node
-backends. Its fee estimator is one small organ inside a much larger organism.
+### Inspired by mempool.space, but not a clone of it
 
-Satya extracts **only that organ** — a live mempool plus a block-template
-simulation, producing fee tiers — as one small binary:
+That approach is exactly what [mempool.space](https://mempool.space) pioneered and
+popularized, and Satya is openly **inspired by it**: the projected-block
+simulation, the CPFP-aware ranking, and the block-template ("GBT") fee estimator
+are its ideas. The forthcoming estimator here follows the same algorithm their
+open-source [`rust-gbt`](https://github.com/mempool/mempool) implements.
+
+**But Satya is deliberately not a re-implementation of mempool.space.** That
+project is a large, multi-service **block explorer** — a whole platform — where
+fee estimation is one small organ inside a much larger organism:
+
+| mempool.space (the platform)                     | Satya                              |
+|--------------------------------------------------|------------------------------------|
+| Block + address explorer, analytics, mining dashboards, Lightning, RBF/accelerator tooling | Just the fee estimator |
+| A backend database, Redis, and multiple node backends | Nothing but your Bitcoin Core node |
+| Many services to deploy and operate              | One static binary                  |
+| A public site you can also self-host (heavy)     | Purpose-built to self-host (light) |
+
+Satya extracts **only that one organ** — a live mempool plus a block-template
+simulation, producing fee tiers — and throws the rest away:
 
 - **Lightweight.** A single static binary. No database, no Redis, no explorer,
   no message bus. It talks to exactly one thing: your node's JSON-RPC endpoint.
@@ -49,8 +75,9 @@ simulation, producing fee tiers — as one small binary:
 - **Purpose-built.** One job — the fee-estimation core — done well, rather than
   a general-purpose explorer you have to operate.
 
-This is the reason the repo exists. It is not a clone; it is the subtraction of
-everything that isn't the fee number.
+This is the reason the repo exists. It is not a clone; it is the *subtraction* of
+everything that isn't the fee number — the same core idea, distilled to a tool you
+can run yourself in one process.
 
 ---
 
@@ -94,13 +121,13 @@ process is worse than a clean crash.
 | `zmq`           | Optional `zmqpubhashblock` listener that wakes the loop on a new block. |
 | `main`          | Wire config → shared state → sync task → HTTP server, with supervision. |
 
-The rest of this document explains the three algorithms that make Satya work:
-**building the mempool** (exists), **the node transport** (exists), and **GBT
-fee estimation** (the next thing to build).
+The rest of this document walks through the three pieces that make Satya work:
+**building the mempool** and **the node transport** (both shipped today), then
+**simulating the next blocks to estimate fees** (the next thing to build).
 
 ---
 
-## Algorithm I — Building the mempool
+## Building the mempool
 
 This is the heart of the running system, and everything downstream stands on it.
 The goal: keep an in-memory `{ txid → tx }` cache that faithfully tracks the
@@ -113,23 +140,31 @@ sync the **delta**, not the whole thing.
 
 ### One steady-state tick
 
-```
-                 ┌──────────────────────── every POLL_INTERVAL_MS, or on a ZMQ block ─┐
-                 ▼                                                                     │
-   getmempoolinfo ──► loaded? min-fee                                                  │
-                 │                                                                     │
-   getrawmempool(false) ──► node txid set  (cheap: just IDs)                           │
-                 │                                                                     │
-   ┌─────────────┴─── decision core (pure) ───────────────┐                           │
-   │  node not loaded, or >80% of the cache vanished?      │── yes ─► bulk resync      │
-   │  (mass-drop / restart guard, 60 s cooldown)           │         (or wait cooldown)│
-   └─────────────┬────────────────────────────────────────┘                           │
-                 │ no                                                                  │
-   diff( cache_keys , node_txids )                                                     │
-        ├─ gone:  remove from cache IMMEDIATELY  (id list is authoritative, no fetch)  │
-        └─ new:   fetch getmempoolentry, bounded concurrency, capped, time-budgeted ───┘
-                 │
-   apply inserts + min-fee + tip; set caught_up ONLY if the tick fully reconciled
+```text
+  wake: every POLL_INTERVAL_MS, or immediately on a ZMQ block
+        |
+        v
+  getmempoolinfo ......... loaded? mempool min-fee
+        |
+        v
+  getrawmempool(false) ... the node's current txid set  (cheap: just IDs)
+        |
+        v
+  decision core (pure) ... node not loaded, or >80% of the cache vanished?
+        |                  (mass-drop / restart guard, 60s cooldown)
+        |
+        +---- yes ---->  bulk resync from scratch   (or wait out the cooldown)
+        |
+        +---- no  ---->  diff( cache_keys , node_txids )
+                              |
+                              +-- gone:  remove from cache immediately
+                              |          (the id list alone proves they left; no fetch)
+                              |
+                              +-- new:   fetch getmempoolentry
+                                         (bounded concurrency, capped, time-budgeted)
+        |
+        v
+  apply inserts + min-fee + tip; set caught_up = true ONLY if the tick fully reconciled
 ```
 
 ### Cold start
@@ -223,7 +258,7 @@ latency possible: the estimate tracks reality instead of trailing it.
 
 ---
 
-## Algorithm II — The node transport
+## Talking to the node: the JSON-RPC transport
 
 Satya's RPC layer is a **hand-rolled async JSON-RPC client over `reqwest`**. We
 deliberately dropped the blocking `bitcoincore-rpc` client so the *entire* system
@@ -288,20 +323,38 @@ call.
 
 ---
 
-## Algorithm III — GBT fee estimation *(the next thing to build)*
+## Estimating fees by simulating the next blocks *(the next thing to build)*
 
 This is the destination — the fee number is the whole point of the project — and
 the piece that is **not yet implemented**. Everything above exists to feed it a
 fresh, complete, honestly-aged mempool; this section specifies the algorithm it
 will run. It is described as a design, not as shipped code.
 
+### Are we simulating mining?
+
+Yes — but only the *selection* half of mining, not the *proof-of-work* half.
+
+Real mining is two separate jobs. First a miner **selects** which mempool
+transactions to put in the candidate block (the fee-maximizing part). Then it
+**grinds** trillions of hashes searching for one below the difficulty target (the
+energy-burning, probabilistic part) to actually win the block.
+
+Satya reproduces **only the first job** — the deterministic block *assembly* that
+Bitcoin Core exposes as `getblocktemplate` (GBT). We are not hashing, not
+competing for a block reward, and not broadcasting anything: we build the same
+candidate block a rational miner *would* build from the current mempool, purely to
+read the fee floor off it. It is a dry run of block construction, not of mining
+economics. (This is exactly why the reference name is "GBT" — get *block
+template*.)
+
 ### The question
 
 *What fee rate confirms in ~N blocks?* Answer it the way the network actually
-answers it: **simulate what a rational miner assembles.** A miner building the
-next block picks the transactions that maximize the fees they collect, under a
-hard size constraint — so if we build the same block from the live mempool, its
-lowest-fee-rate transaction tells us the price of getting into the next block.
+answers it: **simulate what a rational miner would select.** A miner building the
+next candidate block picks the transactions that maximize the fees it collects,
+under a hard size constraint — so if we assemble the same block from the live
+mempool, its lowest-fee-rate transaction tells us the price of getting into the
+next block.
 
 ### The constraint
 
