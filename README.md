@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/satya-lockup-dark.svg">
-    <img alt="Satya" src="assets/logo/satya-lockup.svg" width="440">
-  </picture>
+  <img alt="Satya" src="assets/logo/satya-lockup.svg" width="440">
 </p>
 
 > **Satya** (Sanskrit: *truth*) — the true, live fee your own node sees.
