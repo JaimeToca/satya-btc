@@ -1,4 +1,9 @@
-# Satya
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/satya-lockup-dark.svg">
+    <img alt="Satya" src="assets/logo/satya-lockup.svg" width="440">
+  </picture>
+</p>
 
 > **Satya** (Sanskrit: *truth*) — the true, live fee your own node sees.
 
@@ -12,10 +17,10 @@ binary. No database, no Redis, no explorer.
 
 - [Why Satya exists](#why-satya-exists)
 - [System design](#system-design)
-- [Building the mempool](#building-the-mempool)
-- [Talking to the node: the JSON-RPC transport](#talking-to-the-node-the-json-rpc-transport)
-- [Estimating fees by simulating the next blocks](#estimating-fees-by-simulating-the-next-blocks)
-- [What bounds the accuracy of the estimate](#what-bounds-the-accuracy-of-the-estimate)
+  - [Building the mempool](#building-the-mempool)
+  - [Talking to the node: the JSON-RPC transport](#talking-to-the-node-the-json-rpc-transport)
+  - [Estimating fees by simulating the next blocks](#estimating-fees-by-simulating-the-next-blocks)
+  - [What bounds the accuracy of the estimate](#what-bounds-the-accuracy-of-the-estimate)
 - [Deployment](#deployment)
 - [Engineering notes](#engineering-notes)
 - [License](#license)
@@ -84,13 +89,12 @@ is an infinite loop that only ends via panic; if it ever does, the process
 silently freezing while still cheerfully serving `/health`. A frozen-but-healthy
 process is worse than a clean crash.
 
-The rest of this document walks through the three pieces that make Satya work:
-**building the mempool**, **talking to the node**, and **simulating the next
-blocks to estimate fees**.
+The subsections below cover the four parts of that design in turn: **building the
+mempool** (the in-memory view of the node), **talking to the node** (the JSON-RPC
+transport that feeds it), **estimating fees** (the block simulation that reads
+tiers off that mempool), and **what bounds the accuracy** of the result.
 
----
-
-## Building the mempool
+### Building the mempool
 
 This is the heart of the running system, and everything downstream stands on it.
 The goal: keep an in-memory `{ txid → tx }` cache that faithfully tracks the
@@ -101,7 +105,7 @@ non-starter: a busy mempool is 100+ MB, and pulling it every 2 s is wasteful and
 slow. The trick is that the mempool *changes* slowly relative to its size, so we
 sync the **delta**, not the whole thing.
 
-### One steady-state tick
+#### One steady-state tick
 
 ```text
   wake: every POLL_INTERVAL_MS, or immediately on a ZMQ block
@@ -130,7 +134,7 @@ sync the **delta**, not the whole thing.
   apply inserts + min-fee + tip; set caught_up = true ONLY if the tick fully reconciled
 ```
 
-### Cold start
+#### Cold start
 
 Wait until the node reports its mempool has finished loading
 (`getmempoolinfo.loaded` — older nodes that don't report it are treated as
@@ -138,7 +142,7 @@ loaded), then do a **single bulk seed**: `getrawmempool true` returns the entire
 mempool verbose in one shot. That populates the whole cache, and only then is the
 state marked `caught_up`.
 
-### Steady state
+#### Steady state
 
 Every tick issues the cheap `getrawmempool false` — a bare **txid list** — and
 diffs it against the cache's keys (`compute_diff`):
@@ -161,7 +165,7 @@ diffs it against the cache's keys (`compute_diff`):
   simply reappears in the next tick's `new` set. Nothing is ever permanently
   lost; it's just spread across ticks.
 
-### Safety rail — the mass-drop / restart guard
+#### Safety rail — the mass-drop / restart guard
 
 A node restart is the dangerous case: for a moment the node reports an **empty**
 mempool, and a naive diff would gleefully delete the entire cache and then
@@ -182,7 +186,7 @@ re-download it. Satya guards against this with pure, unit-tested logic in
 Because this logic is pure — no locks, no I/O, no async — it is the one part of
 the system that is directly unit-tested (the loop around it is just I/O).
 
-### The honesty invariant
+#### The honesty invariant
 
 **`caught_up` is `true` only when a tick fully reconciled the node's set** — no
 backlog over the cap, no fetch errors, no budget bail, no RPC failure. Any of
@@ -200,7 +204,7 @@ A fee number is only as trustworthy as the mempool it was computed from, so a
 consumer must be able to tell a fresh mempool from a stale one. Satya makes that
 non-negotiable.
 
-### Latency — ZMQ block-push
+#### Latency — ZMQ block-push
 
 Fees swing most **at block boundaries**: the instant a block confirms, a batch of
 transactions leaves the mempool and the fee floor for "next block" resets. Waiting
@@ -219,9 +223,7 @@ ZMQ is a raw socket on the node, so this path assumes a **local node** — which
 the intended production deployment anyway. A local node plus ZMQ is the lowest
 latency possible: the estimate tracks reality instead of trailing it.
 
----
-
-## Talking to the node: the JSON-RPC transport
+### Talking to the node: the JSON-RPC transport
 
 Satya's RPC layer is a **hand-rolled async JSON-RPC client over `reqwest`**. We
 deliberately dropped the blocking `bitcoincore-rpc` client so the *entire* system
@@ -285,15 +287,13 @@ The `reqwest` client is internally connection-pooled (keep-alive), so a clone is
 cheap and concurrent fetches reuse connections rather than reopening one per
 call.
 
----
-
-## Estimating fees by simulating the next blocks
+### Estimating fees by simulating the next blocks
 
 This is the destination — the fee number is the whole point of the project. The
 mempool builder above exists to feed it a fresh, complete, honestly-aged mempool;
 this section describes the algorithm that turns that mempool into fee tiers.
 
-### Are we simulating mining?
+#### Are we simulating mining?
 
 Yes — but only the *selection* half of mining, not the *proof-of-work* half.
 
@@ -310,7 +310,7 @@ read the fee floor off it. It is a dry run of block construction, not of mining
 economics. (This is exactly why the reference name is "GBT" — get *block
 template*.)
 
-### The question
+#### The question
 
 *What fee rate confirms in ~N blocks?* Answer it the way the network actually
 answers it: **simulate what a rational miner would select.** A miner building the
@@ -319,7 +319,7 @@ under a hard size constraint — so if we assemble the same block from the live
 mempool, its lowest-fee-rate transaction tells us the price of getting into the
 next block.
 
-### The constraint
+#### The constraint
 
 A block is at most **4,000,000 weight units** — weight counts base (non-witness)
 bytes ×4 and witness bytes ×1, and vsize is just `weight / 4`, so the cap is
@@ -333,7 +333,7 @@ per-package descendant limits, or RBF conflict replacement. Those rarely move th
 tier boundaries, but they're the reason to call this "Core-style selection"
 rather than a byte-exact `getblocktemplate`.
 
-### Why naive feerate sorting is wrong: dependencies
+#### Why naive feerate sorting is wrong: dependencies
 
 You cannot just sort every transaction by its own fee rate and fill greedily,
 because transactions have **unconfirmed ancestors**:
@@ -356,7 +356,7 @@ rate**:
 This is the same **ancestor score** Bitcoin Core's `CreateNewBlock` ranks by when
 it assembles a block.
 
-### The greedy package algorithm
+#### The greedy package algorithm
 
 Repeatedly take the transaction with the best **effective (ancestor) fee rate**,
 and add it *together with any of its ancestors not yet included*, if the whole
@@ -382,7 +382,7 @@ leftover mempool to fill the *next* projected block, and the next, and so on.
 Each projected block therefore has a **boundary fee rate** at its bottom edge:
 the cheapest package that still made it into that block.
 
-### From projected blocks to fee tiers
+#### From projected blocks to fee tiers
 
 The tiers are read off the projected-block boundaries, with light smoothing and a
 **1 sat/vB floor**. The time labels assume the ~10-minute average block interval;
@@ -396,7 +396,7 @@ they are expectations, not guarantees (a real block can take much longer):
 | economy         | the boundary of the **last projected block** — the cheapest package still expected to confirm in the current backlog |
 | minimum         | the mempool **min relay fee** (`mempoolminfee`) — the floor below which the node won't even accept the tx |
 
-### Why the sync layer feeds this cleanly
+#### Why the sync layer feeds this cleanly
 
 The mempool builder was designed with this algorithm in mind:
 
@@ -415,9 +415,7 @@ The mempool builder was designed with this algorithm in mind:
 The `/fees` endpoint that exposes these tiers is gated on `caught_up`, so it never
 serves a number computed from a mempool it can't vouch for.
 
----
-
-## What bounds the accuracy of the estimate
+### What bounds the accuracy of the estimate
 
 A fee estimate is only ever as good as the mempool it's computed from, and two
 properties of that mempool set the ceiling on how accurate Satya can be. They come
