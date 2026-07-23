@@ -386,3 +386,36 @@ pub fn is_reconnectable(err: &RpcError) -> bool {
         RpcError::Auth | RpcError::Http(_) | RpcError::HttpStatus { .. }
     )
 }
+
+/// The RPC surface the sync loop consumes. Implemented by the real reqwest
+/// `Rpc` (production) and by the simulation `MockNode` / `SimulatedRpc` (tests).
+/// Native async fn in trait (stable since 1.75) — no `async_trait` macro.
+pub trait MempoolRpc {
+    async fn mempool_info(&self) -> Result<MempoolInfo, RpcError>;
+    async fn raw_mempool_txids(&self) -> Result<Vec<Txid>, RpcError>;
+    async fn raw_mempool_verbose(&self) -> Result<Vec<(Txid, MempoolEntry)>, RpcError>;
+    async fn mempool_entry(&self, txid: &Txid) -> Result<Option<MempoolEntry>, RpcError>;
+    async fn tip_height(&self) -> Result<u64, RpcError>;
+    fn reconnect(&mut self) -> anyhow::Result<()>;
+}
+
+impl MempoolRpc for Rpc {
+    async fn mempool_info(&self) -> Result<MempoolInfo, RpcError> {
+        Rpc::mempool_info(self).await
+    }
+    async fn raw_mempool_txids(&self) -> Result<Vec<Txid>, RpcError> {
+        Rpc::raw_mempool_txids(self).await
+    }
+    async fn raw_mempool_verbose(&self) -> Result<Vec<(Txid, MempoolEntry)>, RpcError> {
+        Rpc::raw_mempool_verbose(self).await
+    }
+    async fn mempool_entry(&self, txid: &Txid) -> Result<Option<MempoolEntry>, RpcError> {
+        Rpc::mempool_entry(self, txid).await
+    }
+    async fn tip_height(&self) -> Result<u64, RpcError> {
+        Rpc::tip_height(self).await
+    }
+    fn reconnect(&mut self) -> anyhow::Result<()> {
+        Rpc::reconnect(self)
+    }
+}
