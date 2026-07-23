@@ -2,10 +2,6 @@
   <img alt="Satya" src="assets/logo/satya-lockup.svg" width="440">
 </p>
 
-<p align="center">
-  <img alt="Satya turns your node's live mempool into honest fee tiers by simulating the next blocks a miner would build" src="assets/satya-demo.gif" width="760">
-</p>
-
 > **Satya** (Sanskrit: *truth*) — the true, live fee your own node sees.
 
 Satya is a single, self-hosted binary that turns your Bitcoin Core node's live
@@ -91,6 +87,10 @@ around one piece of shared state:
   Bitcoin Core ──RPC──►  sync task  ──writes──►  Arc<RwLock<MempoolState>>  ──reads──►  axum HTTP
    (poll ~2s + ZMQ)     (supervised)            (single writer, many readers)          (/health)
 ```
+
+<p align="center">
+  <img alt="Satya turns your node's live mempool into honest fee tiers by simulating the next blocks a miner would build" src="assets/satya-demo.gif" width="760">
+</p>
 
 **Single writer, many readers.** The sync loop is the *only* thing that mutates
 state; HTTP handlers only ever read. This is the central simplification of the
