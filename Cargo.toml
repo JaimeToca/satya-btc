@@ -25,3 +25,9 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 futures = "0.3"
 zeromq = "0.6.0"
+
+# Lean production binary: link-time optimization across crates and a single
+# codegen unit trade longer compile time for a smaller, faster release build.
+[profile.release]
+lto = true
+codegen-units = 1
