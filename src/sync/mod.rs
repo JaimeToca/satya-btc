@@ -1,4 +1,6 @@
 mod decision;
+#[cfg(all(test, feature = "simulation"))]
+mod sim_tests;
 
 use crate::mempool::{
     self, compute_diff, read_state, write_state, MempoolState, MempoolTx, SharedState,

@@ -98,6 +98,11 @@ impl<N: MempoolRpc> SimulatedRpc<N> {
             tokio::time::sleep(self.profile.latency).await;
         }
     }
+
+    /// Test/sim access to the wrapped node (e.g. to advance churn between ticks).
+    pub fn inner_mut(&mut self) -> &mut N {
+        &mut self.inner
+    }
 }
 
 impl<N: MempoolRpc + Clone + Send + Sync + 'static> MempoolRpc for SimulatedRpc<N> {
