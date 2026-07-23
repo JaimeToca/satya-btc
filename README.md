@@ -2,6 +2,10 @@
   <img alt="Satya" src="assets/logo/satya-lockup.svg" width="440">
 </p>
 
+<p align="center">
+  <img alt="Satya turns your node's live mempool into honest fee tiers by simulating the next blocks a miner would build" src="assets/satya-demo.gif" width="760">
+</p>
+
 > **Satya** (Sanskrit: *truth*) — the true, live fee your own node sees.
 
 Satya is a single, self-hosted binary that turns your Bitcoin Core node's live
@@ -515,6 +519,11 @@ BTC_RPC_COOKIE_FILE="$HOME/.bitcoin/.cookie" \
 ```
 
 ### Why not a remote RPC provider
+
+> **Important:** a remote provider is fine for bring-up, but not for a fee
+> estimate you'll act on — it's degraded on freshness, completeness, and trust,
+> the three properties the estimate depends on. Run against your own node for
+> production.
 
 You *can* point `BTC_RPC_URL` at a hosted provider (GetBlock, QuickNode, …) with
 the key in the URL — no local node needed — and it works. It's genuinely handy for
