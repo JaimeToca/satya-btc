@@ -2,3 +2,6 @@
 
 # local env (may hold secrets)
 .env
+
+# Internal planning docs (spec/plan artifacts) — not part of the repo
+docs/superpowers/
