@@ -48,7 +48,7 @@ async fn cold_bulk_load_builds_full_mempool() {
 #[tokio::test]
 async fn steady_churn_local_stays_caught_up() {
     let node = MockNode::new(2, 2_000, churn(30, 30));
-    let mut rpc = SimulatedRpc::new(node.clone(), NetworkProfile::local_node());
+    let mut rpc = SimulatedRpc::new(node, NetworkProfile::local_node());
     let state = empty_state();
     let mut caught_up_prev = false;
     let mut last_bulk = std::time::Instant::now();
@@ -70,7 +70,12 @@ async fn rate_limited_remote_falls_behind() {
     // `getblock_remote` preset) so the test stays fast: the backlog here is
     // caused by the RATE LIMIT (429s => fetch_errors > 0 => is_backlog), not by
     // latency, so there is no need to pay the realistic latency cost in a test.
-    let node = MockNode::new(3, 20_000, churn(600, 600));
+    // The initial mempool size only matters for the bulk load's own cost (the
+    // backlog condition itself is driven by per-tick churn vs. the 20/sec rate
+    // limit, not total size), so it's shrunk from 20,000 to 3,000 to cut the
+    // dominant cost (the verbose bulk-load clone) — confirmed still reliably
+    // triggers `caught_up == false` below.
+    let node = MockNode::new(3, 3_000, churn(600, 600));
     let profile = NetworkProfile {
         latency: Duration::from_millis(1),
         req_per_sec: Some(20),
@@ -94,7 +99,12 @@ async fn rate_limited_remote_falls_behind() {
 }
 
 #[tokio::test]
-async fn mass_drop_triggers_resync() {
+async fn mass_drop_via_bulk_load_shrinks_cache() {
+    // `initial_bulk_load` always bulk-loads regardless of desync logic, so this
+    // only proves the bulk-load path faithfully reflects whatever the node
+    // currently holds — it does NOT exercise `steady_tick`'s desync-DETECTION
+    // branch (see `steady_tick_detects_mass_drop_and_defers_under_cooldown` /
+    // `steady_tick_mass_drop_resyncs_when_cooldown_expired` for that).
     let mut node = MockNode::new(4, 10_000, churn(0, 0));
     node.mass_drop(0.9);
     let mut rpc = SimulatedRpc::new(node, NetworkProfile::local_node());
@@ -103,4 +113,81 @@ async fn mass_drop_triggers_resync() {
 
     initial_bulk_load(&mut rpc, &state, Duration::from_millis(10), &mut caught_up_prev).await;
     assert_eq!(read_state(&state).txs.len(), 1_000, "cache matches post-drop node");
+}
+
+#[tokio::test]
+async fn steady_tick_detects_mass_drop_and_defers_under_cooldown() {
+    // Distinguishes `steady_tick`'s desync-DETECTION branch (`decide_desync` ->
+    // `DesyncAction::WaitCooldown`) from the normal per-tx diff path, using the
+    // real constants in `decision.rs`: MASS_DROP_MIN_CACHE_SIZE = 100,
+    // MASS_DROP_INVERSE = 5 (mass drop when `node * 5 < cache`), RESYNC_COOLDOWN
+    // = 60s.
+    let node = MockNode::new(5, 5_000, churn(0, 0));
+    let mut rpc = SimulatedRpc::new(node, NetworkProfile::local_node());
+    let state = empty_state();
+    let mut caught_up_prev = false;
+
+    initial_bulk_load(&mut rpc, &state, Duration::from_millis(10), &mut caught_up_prev).await;
+    assert_eq!(read_state(&state).txs.len(), 5_000);
+    assert!(read_state(&state).caught_up);
+
+    // mass_drop(0.9) on 5000 txs removes (5000 * 0.9) as usize = 4500, leaving
+    // exactly 500. node*5 = 2500 < cache_len (5000) => is_mass_drop is true;
+    // cache_len (5000) >= MASS_DROP_MIN_CACHE_SIZE (100).
+    rpc.inner_mut().mass_drop(0.9);
+    assert_eq!(rpc.inner_mut().len(), 500);
+
+    // Cooldown ACTIVE: last_bulk_resync is "now", well within RESYNC_COOLDOWN
+    // (60s), so `decide_desync` must route to `WaitCooldown`, NOT `BulkResync`.
+    let mut last_bulk_resync = std::time::Instant::now();
+    steady_tick(&mut rpc, &state, &cfg(), &mut caught_up_prev, &mut last_bulk_resync).await;
+
+    // The distinguishing assertion: the NORMAL per-tx diff path would have
+    // removed the ~4500 departed txids and shrunk the cache to ~500. The cache
+    // staying at 5000 proves `decide_desync` took the mass-drop ->
+    // `WaitCooldown` branch (desync detected, resync deferred by cooldown)
+    // instead of falling through to the normal diff/fetch path. A plain "cache
+    // shrank" assertion could NOT prove this — the point is that it did NOT.
+    assert_eq!(
+        read_state(&state).txs.len(),
+        5_000,
+        "cache must be untouched while the mass-drop resync is cooling down"
+    );
+    assert!(
+        !read_state(&state).caught_up,
+        "mass drop under cooldown must report out of sync"
+    );
+}
+
+#[tokio::test]
+async fn steady_tick_mass_drop_resyncs_when_cooldown_expired() {
+    // Companion to `steady_tick_detects_mass_drop_and_defers_under_cooldown`:
+    // once the cooldown has expired, the SAME mass-drop condition must route to
+    // `DesyncAction::BulkResync` and actually reload from the node, shrinking
+    // the cache to match.
+    let node = MockNode::new(6, 5_000, churn(0, 0));
+    let mut rpc = SimulatedRpc::new(node, NetworkProfile::local_node());
+    let state = empty_state();
+    let mut caught_up_prev = false;
+
+    initial_bulk_load(&mut rpc, &state, Duration::from_millis(10), &mut caught_up_prev).await;
+    assert_eq!(read_state(&state).txs.len(), 5_000);
+
+    rpc.inner_mut().mass_drop(0.9);
+    assert_eq!(rpc.inner_mut().len(), 500);
+
+    // Cooldown EXPIRED: last_bulk_resync is 61s in the past, past RESYNC_COOLDOWN
+    // (60s), so `decide_desync` must route to `BulkResync` and reload now.
+    let mut last_bulk_resync = std::time::Instant::now() - Duration::from_secs(61);
+    steady_tick(&mut rpc, &state, &cfg(), &mut caught_up_prev, &mut last_bulk_resync).await;
+
+    assert_eq!(
+        read_state(&state).txs.len(),
+        500,
+        "bulk resync must fire once the cooldown has expired, reloading from the node"
+    );
+    assert!(
+        read_state(&state).caught_up,
+        "a successful bulk resync must report caught up"
+    );
 }
