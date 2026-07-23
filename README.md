@@ -11,7 +11,7 @@ off that simulation. One static binary. No database, no Redis, no explorer.
 ## Contents
 
 - [Why Satya exists](#why-satya-exists)
-  - [Inspired by mempool.space, but not a clone of it](#inspired-by-mempoolspace-but-not-a-clone-of-it)
+  - [How Satya differs from mempool.space](#how-satya-differs-from-mempoolspace)
 - [System design](#system-design)
 - [Building the mempool](#building-the-mempool)
 - [Talking to the node: the JSON-RPC transport](#talking-to-the-node-the-json-rpc-transport)
@@ -45,17 +45,16 @@ mempool the way a miner does** — rank transactions by their real, CPFP-aware
 effective fee rate, pack them into projected blocks under the real weight limit,
 and read the fee tiers off the boundaries.
 
-### Inspired by mempool.space, but not a clone of it
+### How Satya differs from mempool.space
 
-That approach is exactly what [mempool.space](https://mempool.space) pioneered and
-popularized, and Satya is openly **inspired by it**: the projected-block
-simulation, the CPFP-aware ranking, and the block-template ("GBT") fee estimator
-are its ideas. The forthcoming estimator here follows the same algorithm their
-open-source [`rust-gbt`](https://github.com/mempool/mempool) implements.
+Block-template fee estimation isn't exotic: it's the same logic Bitcoin Core runs
+in `getblocktemplate` to assemble a block, applied to fee estimation instead of
+mining. [mempool.space](https://mempool.space) is the best-known service built on
+it, so it's the natural point of comparison — and it's a useful cross-check for
+the open-source `rust-gbt` version of the algorithm.
 
-**But Satya is deliberately not a re-implementation of mempool.space.** That
-project is a large, multi-service **block explorer** — a whole platform — where
-fee estimation is one small organ inside a much larger organism:
+The difference is **scope**. mempool.space is a full **block explorer** — a whole
+platform — where fee estimation is one small organ inside a much larger organism:
 
 | mempool.space (the platform)                     | Satya                              |
 |--------------------------------------------------|------------------------------------|
