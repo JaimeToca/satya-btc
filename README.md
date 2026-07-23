@@ -4,9 +4,9 @@
 
 Satya is a single, self-hosted binary that turns your Bitcoin Core node's live
 mempool into honest fee recommendations. It keeps an always-current in-memory
-copy of the mempool, synced directly from your node, and (the destination of the
-project) simulates the next few blocks the way a miner would to read fee tiers
-off that simulation. One static binary. No database, no Redis, no explorer.
+copy of the mempool, synced directly from your node, and simulates the next few
+blocks the way a miner would to read fee tiers off that simulation. One static
+binary. No database, no Redis, no explorer.
 
 ## Contents
 
@@ -14,8 +14,8 @@ off that simulation. One static binary. No database, no Redis, no explorer.
 - [System design](#system-design)
 - [Building the mempool](#building-the-mempool)
 - [Talking to the node: the JSON-RPC transport](#talking-to-the-node-the-json-rpc-transport)
-- [Estimating fees by simulating the next blocks](#estimating-fees-by-simulating-the-next-blocks-the-next-thing-to-build)
-- [Why your own node](#why-your-own-node-and-how-it-shapes-accuracy)
+- [Estimating fees by simulating the next blocks](#estimating-fees-by-simulating-the-next-blocks)
+- [What bounds the accuracy of the estimate](#what-bounds-the-accuracy-of-the-estimate)
 - [Deployment](#deployment)
 - [Engineering notes](#engineering-notes)
 - [License](#license)
@@ -44,15 +44,16 @@ mempool the way a miner does** — rank transactions by their real, CPFP-aware
 effective fee rate, pack them into projected blocks under the real weight limit,
 and read the fee tiers off the boundaries.
 
-This is the same block-template approach [mempool.space](https://mempool.space)
-is best known for — it's really just Bitcoin Core's own `getblocktemplate` logic
-pointed at fee estimation instead of mining. The difference is **scope**:
-mempool.space is a full block explorer (analytics, mining dashboards, Lightning,
-a database, Redis, multiple node backends), where fee estimation is one small
-organ. Satya is **only that organ** — a single static binary that talks to
-nothing but your own Bitcoin Core node, computes the fee tiers, and throws the
-rest of the explorer away. Same core idea, distilled to a tool you can run
-yourself in one process.
+Satya does exactly this and nothing else: it runs the **fee-maximizing half of
+block assembly** — the Core-style ancestor-package selection Bitcoin Core's
+`CreateNewBlock` / `getblocktemplate` uses to decide *which* transactions a
+rational miner would include — and reads the fee tiers off the result, in a single
+static binary that talks to nothing but your own node. Full explorers like
+[mempool.space](https://mempool.space) also surface a fee estimate, but bundle it
+inside a whole platform (analytics, mining dashboards, Lightning, a database,
+Redis, multiple node backends). Satya keeps the estimator and drops the rest of
+the explorer, so what you run and operate is just the fee engine — self-hosted,
+private, and trivial to deploy.
 
 ---
 
@@ -97,8 +98,8 @@ process is worse than a clean crash.
 | `main`          | Wire config → shared state → sync task → HTTP server, with supervision. |
 
 The rest of this document walks through the three pieces that make Satya work:
-**building the mempool** and **the node transport** (both shipped today), then
-**simulating the next blocks to estimate fees** (the next thing to build).
+**building the mempool**, **talking to the node**, and **simulating the next
+blocks to estimate fees**.
 
 ---
 
@@ -242,8 +243,9 @@ budget-bail above) possible, since dropping a `reqwest` future actually cancels
 the in-flight request.
 
 It's small on purpose, and every design choice is about being **DRY** and safe
-against an **untrusted endpoint** (a remote provider is fully supported, so the
-transport treats the far side as hostile).
+against an **untrusted endpoint**. A remote provider is supported for bring-up (and
+production accuracy still wants a local node — see [Deployment](#deployment)), but
+the transport treats the far side as hostile regardless.
 
 - **One generic path.** Every typed method (`getblockchaininfo`,
   `getmempoolinfo`, `getrawmempool`, `getmempoolentry`) funnels through a single
@@ -298,12 +300,11 @@ call.
 
 ---
 
-## Estimating fees by simulating the next blocks *(the next thing to build)*
+## Estimating fees by simulating the next blocks
 
-This is the destination — the fee number is the whole point of the project — and
-the piece that is **not yet implemented**. Everything above exists to feed it a
-fresh, complete, honestly-aged mempool; this section specifies the algorithm it
-will run. It is described as a design, not as shipped code.
+This is the destination — the fee number is the whole point of the project. The
+mempool builder above exists to feed it a fresh, complete, honestly-aged mempool;
+this section describes the algorithm that turns that mempool into fee tiers.
 
 ### Are we simulating mining?
 
@@ -333,8 +334,17 @@ next block.
 
 ### The constraint
 
-A block is at most **4,000,000 weight units** (≈ 1,000,000 vB), minus the space
-the coinbase takes. Within that budget a miner maximizes total fees.
+A block is at most **4,000,000 weight units** — weight counts base (non-witness)
+bytes ×4 and witness bytes ×1, and vsize is just `weight / 4`, so the cap is
+≈1,000,000 vB — minus a small reserve for the coinbase transaction. Within that
+budget a miner maximizes total fees. Satya ranks transactions in fee-per-vByte but
+packs against the remaining **weight**, exactly as Core does.
+
+This is a deliberate simplification of full block assembly: it models the
+fee-maximizing ancestor-package selection, and does **not** model sigop limits,
+per-package descendant limits, or RBF conflict replacement. Those rarely move the
+tier boundaries, but they're the reason to call this "Core-style selection"
+rather than a byte-exact `getblocktemplate`.
 
 ### Why naive feerate sorting is wrong: dependencies
 
@@ -356,8 +366,8 @@ rate**:
                    tx.vsize + vsizes of all its unconfirmed ancestors
 ```
 
-This is exactly the quantity Bitcoin Core's `CreateNewBlock` and mempool.space's
-`rust-gbt` rank by.
+This is the same **ancestor score** Bitcoin Core's `CreateNewBlock` ranks by when
+it assembles a block.
 
 ### The greedy package algorithm
 
@@ -388,66 +398,62 @@ the cheapest package that still made it into that block.
 ### From projected blocks to fee tiers
 
 The tiers are read off the projected-block boundaries, with light smoothing and a
-**1 sat/vB floor**:
+**1 sat/vB floor**. The time labels assume the ~10-minute average block interval;
+they are expectations, not guarantees (a real block can take much longer):
 
 | Tier            | Source                                                      |
 |-----------------|------------------------------------------------------------|
 | next block / fastest | boundary fee rate of **block 1**                      |
 | ~30 min         | boundary of **~block 3**                                    |
 | ~1 hour         | boundary of **~block 6**                                    |
-| economy         | near the mempool's min-fee floor                           |
-| minimum         | the mempool **min relay fee** (`mempoolminfee`)            |
+| economy         | the boundary of the **last projected block** — the cheapest package still expected to confirm in the current backlog |
+| minimum         | the mempool **min relay fee** (`mempoolminfee`) — the floor below which the node won't even accept the tx |
 
-### Why the sync layer already feeds this
+### Why the sync layer feeds this cleanly
 
 The mempool builder was designed with this algorithm in mind:
 
-- **`MempoolTx` already captures package data.** Each cached tx carries
+- **`MempoolTx` captures the package data.** Each cached tx carries
   `ancestor_fee`/`ancestor_vsize` and `descendant_fee`/`descendant_vsize`,
   pulled from `getmempoolentry` — exactly the ancestor totals the greedy packing
-  needs. (One caveat the code already documents: those totals are a *snapshot*
-  taken at fetch time and can drift as related txs come and go, so the estimator
-  must **recompute** package feerates from a fresh source rather than trust the
-  cached snapshot as live.)
-- **It should run incrementally.** `rust-gbt` calls this an *audit*: rather than
-  rebuild every block template from scratch, re-derive it against each mempool
-  delta. Fed by the fresh sync loop and ZMQ block-push, the fee number tracks
-  reality with minimal latency — which is the entire reason the sync layer works
-  as hard as it does on freshness.
+  needs. (One caveat: those totals are a *snapshot* taken at fetch time and can
+  drift as related txs come and go, so the estimator **recomputes** package
+  feerates from the live cache rather than trusting the cached snapshot as final.)
+- **It runs incrementally.** Rather than rebuild every block template from
+  scratch, the estimator re-derives it against each mempool delta. Fed by the
+  fresh sync loop and ZMQ block-push, the fee number tracks reality with minimal
+  latency — which is the entire reason the sync layer works as hard as it does on
+  freshness.
 
-The `/fees` endpoint that exposes these tiers will be gated on `caught_up`, so it
-never serves a number computed from a mempool it can't vouch for.
+The `/fees` endpoint that exposes these tiers is gated on `caught_up`, so it never
+serves a number computed from a mempool it can't vouch for.
 
 ---
 
-## Why your own node (and how it shapes accuracy)
+## What bounds the accuracy of the estimate
 
-You *can* run Satya against a remote provider, and it works. But a node you
-control is strictly better, and the reason is the fee algorithm itself: **a fee
-estimate is only ever as good as the mempool it's computed from.** Two properties
-of that mempool bound the accuracy:
+A fee estimate is only ever as good as the mempool it's computed from, and two
+properties of that mempool set the ceiling on how accurate Satya can be. They come
+from two different places — one is Satya's job, the other is the node operator's.
 
-- **Completeness.** Missing transactions make the simulation under-count
-  congestion, so it estimates fees **too low** — and a too-low fee is exactly
-  what leaves a transaction stuck. A local node holds the full mempool up to its
-  `maxmempool`; a rate-limited, latency-bound remote fetch can be incomplete (and
-  Satya then honestly reports `caught_up=false` rather than vouch for a partial
-  view). A small `maxmempool` also evicts the lowest-fee transactions and
-  **truncates the bottom of the fee distribution**, which is what skews the
-  economy tier.
+- **Completeness (a node-config property).** Missing transactions make the
+  simulation under-count congestion, so it estimates fees **too low** — and a
+  too-low fee is exactly what leaves a transaction stuck. This is bounded by the
+  node, not by Satya: a node holds the full mempool only up to its `maxmempool`,
+  and a small `maxmempool` evicts the lowest-fee transactions and **truncates the
+  bottom of the fee distribution**, which is what skews the economy tier. Note
+  `caught_up` does *not* catch this — it only asserts that Satya's cache matches
+  *this node's* mempool set, so a truncated node can be fully `caught_up` and still
+  give a skewed economy tier. Completeness is a matter of configuring the node
+  right (see [Deployment](#deployment)), not something the sync layer can detect.
 
-- **Freshness.** The estimate reflects the mempool **at fetch time**, and it goes
-  stale **worst exactly when it matters most** — during a fee spike or right at a
-  block boundary, when the mempool moves fastest. Remote latency or an un-synced
-  node makes that snapshot lag. A local node plus ZMQ block-push gives the lowest
-  possible latency.
-
-- **Trust and privacy.** Your numbers are computed locally, from your node's
-  mempool. You don't trust a third party's view of the network, and nobody sees
-  which fees or transactions you care about.
-
-Remote providers trade away freshness and trust — precisely the two things the
-fee estimate is built on. Fine for a look; not how you'd run it for real.
+- **Freshness (Satya's job).** The estimate reflects the mempool **at fetch
+  time**, and it goes stale **worst exactly when it matters most** — during a fee
+  spike or right at a block boundary, when the mempool moves fastest. This is what
+  the sync layer's honesty contract (`caught_up` / `last_sync_ok` / `age_secs`) and
+  ZMQ block-push exist to protect: a local node plus ZMQ gives the lowest possible
+  latency, and when the view *is* behind, `/health` says so rather than serving a
+  stale number as fresh.
 
 ---
 
@@ -456,115 +462,50 @@ fee estimate is built on. Fine for a look; not how you'd run it for real.
 Satya is a single static binary that talks to **one** thing: a Bitcoin Core
 JSON-RPC endpoint. That endpoint is the only dependency you must supply.
 
-### Dependencies
+To build from source you need **Rust** (stable; developed against 1.93) — skip it
+if you deploy the Docker image. Optional helpers: [`just`](https://github.com/casey/just)
+for the `just <recipe>` shortcuts, [`jq`](https://jqlang.github.io/jq/) to
+pretty-print `/health`, and [Docker](https://docs.docker.com/get-docker/) for the
+container path. The one hard dependency is the RPC endpoint below.
 
-| Dependency | Required? | How to get it |
-|------------|-----------|---------------|
-| **Rust** (stable) | to build from source | [rustup](https://rustup.rs): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh`. Builds on latest stable (developed against 1.93). Not needed if you deploy the Docker image. |
-| **A Bitcoin RPC endpoint** | **yes** — the one hard dependency | **Run your own node** ([Bitcoin Core](https://bitcoincore.org/en/download/), verified against v29) — regtest/signet/mainnet, see the paths below — **or** point at a **remote provider** (GetBlock, QuickNode, …) with the key in the URL. |
-| [**`just`**](https://github.com/casey/just) | optional | `cargo install just`. Task runner for the `just <recipe>` shortcuts below; each recipe is a thin wrapper over the underlying `cargo`/`curl`/`bitcoin-cli` command. |
-| [**Docker**](https://docs.docker.com/get-docker/) | optional | Only for the container path (`just docker` / `docker compose up`). |
-| [**`jq`**](https://jqlang.github.io/jq/) | optional | Pretty-prints `/health` in `just health`. Any JSON tool (or none) works. |
+### Run against your own node (recommended)
 
-You need **exactly one** RPC endpoint. Pick the path that matches your goal:
-
-| Path | Endpoint | Disk | Real fees? | Use it for |
-|------|----------|------|-----------|------------|
-| **A — regtest** | local `bitcoind -regtest` | ~0 | no (you mint blocks) | fastest smoke test of the mechanics |
-| **B — signet** | local `bitcoind -signet` | a few GB | no (test-net levels) | realistic relay on a real (test) mempool |
-| **C — mainnet node** | your own node | ~15 GB+ | yes | **production** |
-| **D — remote provider** | `https://provider/<key>` | 0 | yes but degraded | zero-infra look, works today |
-
-#### Path A — Fastest test (regtest, zero disk)
-
-Regtest is a private chain you mine yourself: no download, no sync, disposable.
-It proves the sync loop / `/health` plumbing works, but the fees are meaningless
-(you decide when blocks happen) — **mechanics only, not real fees.**
-
-```bash
-just regtest-up          # starts bitcoind -regtest, a `dev` wallet, and 101 mature blocks
-```
-
-<details><summary>…or the manual equivalent</summary>
-
-```bash
-bitcoind -regtest -daemon
-bitcoin-cli -regtest createwallet dev
-bitcoin-cli -regtest generatetoaddress 101 "$(bitcoin-cli -regtest getnewaddress)"
-```
-</details>
-
-Point Satya at it (regtest RPC is on **18443**; cookie lives under the `regtest/`
-subdir) and create some mempool activity:
-
-```bash
-BTC_RPC_URL=http://127.0.0.1:18443 \
-BTC_RPC_COOKIE_FILE="$HOME/.bitcoin/regtest/.cookie" \
-./target/release/satya &          # or: just run  (reads .env — its defaults target regtest)
-
-just regtest-tx                    # sends one tx into the mempool
-just health                        # expect mempool_size >= 1, caught_up: true
-```
-
-Tear it down with `just regtest-down`.
-
-#### Path B — Realistic test (signet)
-
-Signet is a stable, low-volume public test network with **real relay** and a real
-(if small) mempool. It syncs in minutes and a few GB, exercising Satya against
-genuine mempool dynamics — but signet fee levels are **not mainnet fee levels**,
-so treat the numbers as a functional check, not a production estimate.
-
-`bitcoin.conf`:
-
-```ini
-signet=1
-server=1
-# blocksonly MUST stay off (default) so the mempool relays
-```
-
-Start `bitcoind`, wait for it to reach the tip, and run Satya against the signet
-RPC port (**38332**), cookie under `signet/`:
-
-```bash
-BTC_RPC_URL=http://127.0.0.1:38332 \
-BTC_RPC_COOKIE_FILE="$HOME/.bitcoin/signet/.cookie" \
-./target/release/satya
-```
-
-#### Path C — Production (your own mainnet node, low disk)
-
-The real deployment: fees computed from **your** node's live mainnet mempool. You
-need a **full, tip-synced, non-`blocksonly`** node — but not a heavy one:
+Satya is meant to run against a Bitcoin Core node **you control**, on mainnet. A
+minimal, low-disk node is enough — it does **not** need to be a heavy archival
+node:
 
 ```ini
 server=1              # enable JSON-RPC
 prune=550             # MB; smallest allowed. Mempool RPCs are unaffected by pruning.
-maxmempool=300        # MB; larger = fuller mempool view = truer fees (see "Why your own node")
+maxmempool=300        # MB; larger = fuller mempool view = truer fees (see below)
 # txindex NOT set     # not needed — mempool RPCs never touch a tx index
 # blocksonly MUST stay off (default) — it disables mempool relay -> useless fees
 rpcthreads=10         # >= FETCH_CONCURRENCY so parallel fetches aren't serialized
 # rpcworkqueue=16     # keep FETCH_CONCURRENCY <= this (default 16)
-# zmqpubhashblock=tcp://0.0.0.0:28332   # optional: immediate recompute on new blocks
+zmqpubhashblock=tcp://127.0.0.1:28332   # recommended: immediate recompute on new blocks
 ```
 
-**No `txindex`. Pruning is fine.** The mempool lives in memory, independent of
-block storage, so every RPC Satya uses works on a pruned node. It **must not** be
-`blocksonly` (that kills mempool relay) and **must** be caught up to the tip (a
-syncing node has an unrepresentative mempool).
+The three rules that matter: it **must not** be `blocksonly` (that disables
+mempool relay, so there'd be nothing to estimate from), it **must** be caught up
+to the tip (a syncing node has an unrepresentative mempool), and a healthy
+`maxmempool` keeps the low-fee tail intact (a small one truncates the bottom of
+the fee distribution and skews the economy tier). **No `txindex` and pruning are
+both fine** — the mempool lives in memory, independent of block storage, so every
+RPC Satya uses works on a pruned node.
 
-Two cheap ways to stand up a usable node:
+You don't need to wait out a full initial block download to get there. `prune=550`
+plus an **`assumeutxo` snapshot** (Core 26+, via `loadtxoutset`; see the current
+[Core assumeutxo documentation](https://github.com/bitcoin/bitcoin/blob/master/doc/assumeutxo.md))
+gets a node serving
+mempool/fee RPCs far sooner than a from-scratch sync: it jumps to the snapshot
+height and background-validates the rest of the chain behind you. How fast "usable"
+actually is depends on snapshot download, bandwidth, and peer connectivity — and
+note the mempool itself starts empty and **fills from relay** once you have peers,
+not from the snapshot, so give it a little time to populate before trusting the
+tiers. Steady-state disk is on the order of ~15 GB, dominated by the unprunable
+chainstate.
 
-- **Pruned node** — set `prune=550` (or larger). Steady-state disk is small
-  (**~15 GB**, including the ~11 GB unprunable chainstate), but you still pay a
-  one-time **full ~600 GB IBD download** as the node validates the whole chain
-  (the blocks are discarded as it goes; only the download is unavoidable).
-- **`assumeutxo` snapshot** (Core 26+) — `loadtxoutset` a recent UTXO snapshot and
-  the node is usable **in minutes**: it jumps to the snapshot height, serves
-  mempool/fee RPCs immediately, and **background-validates** the rest of the chain
-  behind you. Pair it with `prune=550` for a small, fast-to-stand-up node.
-
-Either way, run Satya against the mainnet RPC (**8332**):
+Run Satya against the mainnet RPC (**8332**) with cookie auth:
 
 ```bash
 BTC_RPC_URL=http://127.0.0.1:8332 \
@@ -572,20 +513,49 @@ BTC_RPC_COOKIE_FILE="$HOME/.bitcoin/.cookie" \
 ./target/release/satya
 ```
 
-#### Path D — No node (remote provider)
+### Why not a remote RPC provider
 
-Zero local infrastructure: point `BTC_RPC_URL` at a hosted provider whose API key
-is in the URL (no separate auth). Works today, fine for a quick look.
+You *can* point `BTC_RPC_URL` at a hosted provider (GetBlock, QuickNode, …) with
+the key in the URL — no local node needed — and it works. But it is **degraded on
+exactly the two properties the fee estimate depends on**:
 
-```bash
-BTC_RPC_URL=https://go.getblock.io/<YOUR_KEY> ./target/release/satya
+- **Freshness.** Each `getmempoolentry` becomes an internet round-trip instead of
+  a sub-ms local call, and you hit rate limits — so the mempool view lags, and it
+  lags worst during a fee spike or right at a block boundary, when the mempool
+  moves fastest and a good estimate matters most. There's also no ZMQ block-push
+  over a remote socket. (Satya stays honest about it: when latency blows the tick
+  budget it reports `caught_up=false` rather than vouch for a stale view.)
+- **Trust and privacy.** You'd be trusting the provider's view of the mempool
+  instead of your own, and leaking which fees and transactions you care about to a
+  party that sees every request.
+
+A node you control is strictly better on both counts, which is why it's the
+recommended deployment.
+
+### Testing on signet
+
+To exercise Satya against a real (if small) mempool without touching mainnet, run
+a local **signet** node — it syncs in minutes and a few GB:
+
+```ini
+signet=1
+server=1
+# blocksonly MUST stay off (default) so the mempool relays
 ```
 
-But it is **degraded** for fee accuracy: each `getmempoolentry` is an
-internet round-trip (not a sub-ms local call), you hit **rate limits**, you
-**trust the provider's mempool**, and there is **no ZMQ** block-push. Satya stays
-honest — when latency blows the tick budget it reports `caught_up=false` — but see
-[Why your own node](#why-your-own-node-and-how-it-shapes-accuracy).
+Then point Satya at the signet RPC port (**38332**), cookie under the `signet/`
+subdir:
+
+```bash
+BTC_RPC_URL=http://127.0.0.1:38332 \
+BTC_RPC_COOKIE_FILE="$HOME/.bitcoin/signet/.cookie" \
+./target/release/satya
+```
+
+This exercises the sync/transport/`/health` plumbing against genuine relay, but a
+thin signet mempool rarely has enough backlog to fill multiple projected blocks, so
+the fee *tiers* it produces are uninteresting by design — signet fee levels aren't
+mainnet levels. Treat it as a functional check, not a production estimate.
 
 ### Run it
 
@@ -595,7 +565,7 @@ honest — when latency blows the tick budget it reports `caught_up=false` — b
 cargo build --release            # or: just release   (LTO'd; see [profile.release])
 
 BTC_RPC_URL=... BTC_RPC_COOKIE_FILE=... ./target/release/satya
-# or: copy .env.example -> .env and use `just run` (loads .env; defaults target Path A)
+# or: copy .env.example -> .env and use `just run` (loads .env)
 
 curl -s http://127.0.0.1:8080/health | jq      # or: just health
 ```
