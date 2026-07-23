@@ -344,6 +344,19 @@ async fn steady_tick(
     // log field.
     let mempool_size = projected_mempool_size(cache_len, diff.gone.len(), res.fetched.len());
 
+    // Per-tick building summary. `debug` so `info` prod runs stay quiet, but
+    // `RUST_LOG=satya::sync=debug` shows the mempool churn live: how many txids
+    // the node added/removed this tick, how many we fetched, the running size,
+    // and whether we're keeping up.
+    tracing::debug!(
+        new = diff.new.len(),
+        gone = diff.gone.len(),
+        fetched = res.fetched.len(),
+        size = mempool_size,
+        backlog,
+        "mempool tick"
+    );
+
     {
         let mut g = write_state(state);
         for (txid, tx) in res.fetched {
