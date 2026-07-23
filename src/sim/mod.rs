@@ -12,9 +12,12 @@
 #![allow(dead_code)]
 
 pub mod mock_node;
+pub mod network;
 
 // Consumed by later sim tasks (`crate::sim::{...}` in network.rs / sync sim
 // tests / the HTTP server). Scoped allow on just this re-export so an unused
 // import ANYWHERE ELSE in the sim tree still fails the `-D warnings` gate.
 #[allow(unused_imports)]
 pub use mock_node::{ChurnConfig, FeeDistribution, MockNode};
+#[allow(unused_imports)]
+pub use network::{NetworkProfile, SimulatedRpc};

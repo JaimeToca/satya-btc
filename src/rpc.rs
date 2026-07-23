@@ -98,7 +98,7 @@ pub struct MempoolInfo {
 }
 
 /// One `getmempoolentry` / `getrawmempool true` entry — only the fields we use.
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct MempoolEntry {
     /// Older Core / alt stacks emit this as `size`; accept both.
     #[serde(alias = "size")]
@@ -116,7 +116,7 @@ pub struct MempoolEntry {
 
 /// The `fees` sub-object of a mempool entry. Core reports each as BTC decimals;
 /// `as_btc` parses BTC decimals to integer sats (exact; same as the old path).
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct MempoolEntryFees {
     #[serde(with = "bitcoin::amount::serde::as_btc")]
     pub base: Amount,
