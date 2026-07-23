@@ -45,7 +45,7 @@ effective fee rate, pack them into projected blocks under the real weight limit,
 and read the fee tiers off the boundaries.
 
 Satya does exactly this and nothing else: it runs the **fee-maximizing half of
-block assembly** — the same ancestor-package selection Bitcoin Core's
+block assembly** — the Core-style ancestor-package selection Bitcoin Core's
 `CreateNewBlock` / `getblocktemplate` uses to decide *which* transactions a
 rational miner would include — and reads the fee tiers off the result, in a single
 static binary that talks to nothing but your own node. Full explorers like
@@ -334,11 +334,11 @@ next block.
 
 ### The constraint
 
-A block is at most **4,000,000 weight units** (a transaction's weight is
-`4 × vsize` for non-witness bytes, less for witness data; ~1,000,000 vB in
-practice), minus a small reserve for the coinbase transaction. Within that budget
-a miner maximizes total fees. Satya ranks transactions in fee-per-vByte but packs
-against the remaining **weight**, exactly as Core does.
+A block is at most **4,000,000 weight units** — weight counts base (non-witness)
+bytes ×4 and witness bytes ×1, and vsize is just `weight / 4`, so the cap is
+≈1,000,000 vB — minus a small reserve for the coinbase transaction. Within that
+budget a miner maximizes total fees. Satya ranks transactions in fee-per-vByte but
+packs against the remaining **weight**, exactly as Core does.
 
 This is a deliberate simplification of full block assembly: it models the
 fee-maximizing ancestor-package selection, and does **not** model sigop limits,
@@ -495,7 +495,8 @@ RPC Satya uses works on a pruned node.
 
 You don't need to wait out a full initial block download to get there. `prune=550`
 plus an **`assumeutxo` snapshot** (Core 26+, via `loadtxoutset`; see the current
-[Core assumeutxo docs](https://bitcoincore.org/en/releases/)) gets a node serving
+[Core assumeutxo documentation](https://github.com/bitcoin/bitcoin/blob/master/doc/assumeutxo.md))
+gets a node serving
 mempool/fee RPCs far sooner than a from-scratch sync: it jumps to the snapshot
 height and background-validates the rest of the chain behind you. How fast "usable"
 actually is depends on snapshot download, bandwidth, and peer connectivity — and
