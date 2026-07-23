@@ -515,21 +515,46 @@ BTC_RPC_COOKIE_FILE="$HOME/.bitcoin/.cookie" \
 ### Why not a remote RPC provider
 
 You *can* point `BTC_RPC_URL` at a hosted provider (GetBlock, QuickNode, …) with
-the key in the URL — no local node needed — and it works. But it is **degraded on
-exactly the two properties the fee estimate depends on**:
+the key in the URL — no local node needed — and it works. It's genuinely handy for
+**bring-up**: a zero-infrastructure way to kick the tyres or run a quick functional
+check. But for a fee estimate you'd actually act on, it is **degraded on exactly
+the properties the estimate depends on** — and the reason is structural, not a
+knock on any provider's quality.
 
-- **Freshness.** Each `getmempoolentry` becomes an internet round-trip instead of
-  a sub-ms local call, and you hit rate limits — so the mempool view lags, and it
-  lags worst during a fee spike or right at a block boundary, when the mempool
-  moves fastest and a good estimate matters most. There's also no ZMQ block-push
-  over a remote socket. (Satya stays honest about it: when latency blows the tick
-  budget it reports `caught_up=false` rather than vouch for a stale view.)
-- **Trust and privacy.** You'd be trusting the provider's view of the mempool
+**Satya's sync pattern is unusually latency-sensitive.** Each steady-state tick
+issues `getmempoolinfo` and `getrawmempool false`, then **one `getmempoolentry`
+per newly-seen transaction** (up to 2000/tick, `FETCH_CONCURRENCY` in flight). On a
+local node every one of those is a sub-millisecond loopback call, so a full tick
+finishes in a few ms. Against a remote provider each becomes an **internet
+round-trip** (tens to hundreds of ms), so a busy tick — especially the refill burst
+right after a block — can blow past `TICK_BUDGET_MS`. Satya stays honest and reports
+`caught_up=false`, but your mempool view is now *lagging reality*.
+
+That degradation lands on the two things the estimate is built on:
+
+- **Freshness.** The lag is worst at exactly the wrong moment — a **fee spike or a
+  block boundary**, when the mempool churns fastest and a good estimate matters
+  most — so the number trails the market instead of tracking it. Two things make it
+  worse: **rate limits** (the per-tx `getmempoolentry` fan-out is exactly what
+  providers throttle; capped calls get retried next tick, falling further behind),
+  and **no ZMQ block-push** over a remote socket (so you lose the immediate-on-block
+  recompute and are back to polling). A local node has neither limit.
+- **Completeness.** You inherit *their* node's mempool: you don't control its
+  `maxmempool` and can't verify it isn't filtered or truncated, so a missing
+  low-fee tail silently skews your economy tier. With your own node you *know* it's
+  a full, tip-synced, relaying mempool.
+- **Trust and privacy.** You'd be trusting the provider's view of the network
   instead of your own, and leaking which fees and transactions you care about to a
   party that sees every request.
 
-A node you control is strictly better on both counts, which is why it's the
+A node you control is strictly better on all three counts, which — combined with how
+cheap Satya is to self-host next to a pruned / `assumeutxo` node — is why it's the
 recommended deployment.
+
+> **Security note.** A provider key embedded in `BTC_RPC_URL`
+> (`https://…/<KEY>`) is a credential. Keep it in `.env` (gitignored), not in
+> committed files or shared logs — Satya already strips the URL from transport
+> errors so the key can't leak that way — and rotate it if it's ever exposed.
 
 ### Testing on signet
 
