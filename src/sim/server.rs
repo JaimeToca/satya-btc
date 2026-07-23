@@ -40,7 +40,18 @@ struct JsonRpcRequest {
 /// `profile`'s rate limit. `port = 0` picks an ephemeral free port. Spawns the
 /// axum server task AND a background churn timer (advances the node every 2s)
 /// on the current tokio runtime, then returns the bound address.
-pub async fn spawn(node: MockNode, profile: NetworkProfile, port: u16) -> SocketAddr {
+///
+/// Bind failures (e.g. the requested port is already in use) are propagated as
+/// `Err` rather than panicking, so a caller (the `sim-serve` CLI, or a test
+/// that races a port) can report a clean error instead of leaving a
+/// half-started, unreachable server task behind.
+pub async fn spawn(
+    node: MockNode,
+    profile: NetworkProfile,
+    port: u16,
+) -> anyhow::Result<SocketAddr> {
+    use anyhow::Context;
+
     let state = Arc::new(ServerState {
         node: Mutex::new(node),
         limiter: Mutex::new(Limiter::new()),
@@ -53,11 +64,15 @@ pub async fn spawn(node: MockNode, profile: NetworkProfile, port: u16) -> Socket
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
+        .with_context(|| format!("sim server failed to bind 127.0.0.1:{port}"))?;
+    let addr = listener
+        .local_addr()
+        .context("sim server failed to read bound local_addr")?;
 
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!(error = %e, "sim server exited with error");
+        }
     });
 
     // Keep the mempool alive: advance churn on a fixed tick so a client
@@ -71,7 +86,7 @@ pub async fn spawn(node: MockNode, profile: NetworkProfile, port: u16) -> Socket
         }
     });
 
-    addr
+    Ok(addr)
 }
 
 async fn handle_rpc(
@@ -220,7 +235,7 @@ pub async fn run_cli() -> anyhow::Result<()> {
         NetworkProfile::local_node()
     };
 
-    let addr = spawn(node, profile, args.port).await;
+    let addr = spawn(node, profile, args.port).await?;
     tracing::info!(%addr, "sim node serving; point BTC_RPC_URL at it");
     std::future::pending::<anyhow::Result<()>>().await
 }

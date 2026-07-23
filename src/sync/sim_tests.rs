@@ -60,6 +60,11 @@ async fn steady_churn_local_stays_caught_up() {
         rpc.inner_mut().advance();
         steady_tick(&mut rpc, &state, &cfg(), &mut caught_up_prev, &mut last_bulk).await;
         assert!(read_state(&state).caught_up, "local profile must stay caught up");
+        assert_eq!(
+            read_state(&state).txs.len(),
+            rpc.inner_mut().len(),
+            "a fast local profile must fully track the node's size every tick, not just report caught_up"
+        );
     }
 }
 
@@ -95,6 +100,27 @@ async fn rate_limited_remote_falls_behind() {
     assert!(
         !read_state(&state).caught_up,
         "throttled per-tx catch-up must report backlog (caught_up=false)"
+    );
+
+    // Prove the backlog is genuine partial progress caused by 429s, not the
+    // alternate cause `new_count > MAX_NEW_FETCH_PER_TICK` (2000): this tick's
+    // uncapped `diff.new` is only 600 (churn(600, 600)'s arrivals_per_tick),
+    // well under the 2000 cap, so that branch of `is_backlog` can't be what
+    // tripped `caught_up = false` here — it must be `fetch_errors > 0` from the
+    // 20/sec rate limit. Removals (`diff.gone`) are applied unconditionally
+    // (no RPC involved), so the cache lost all 600 evicted txids this tick
+    // while the throttled fetch pass could only land a handful of the 600
+    // new arrivals within the budget; the node's total size is restored to
+    // 3,000 by `advance()` (600 evicted + 600 arrived), so the cache must be
+    // strictly behind the node (some fetches succeeded, but nowhere near all
+    // of them) while still holding the bulk of its pre-tick contents.
+    let cache_len = read_state(&state).txs.len();
+    let node_len = rpc.inner_mut().len();
+    assert!(cache_len > 0, "cache must not be emptied by the rate limit");
+    assert!(
+        cache_len < node_len,
+        "cache ({cache_len}) must be strictly behind the node ({node_len}): the 429s dropped \
+         some fetches, not all, proving partial progress rather than a total stall"
     );
 }
 

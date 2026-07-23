@@ -28,7 +28,9 @@ mod tests {
 
     #[tokio::test]
     async fn real_client_bulk_loads_over_http() {
-        let addr = server::spawn(node(500), NetworkProfile::local_node(), 0).await;
+        let addr = server::spawn(node(500), NetworkProfile::local_node(), 0)
+            .await
+            .unwrap();
         let rpc = client(addr);
         let entries = rpc.raw_mempool_verbose().await.unwrap();
         assert_eq!(entries.len(), 500);
@@ -37,11 +39,11 @@ mod tests {
     #[tokio::test]
     async fn real_client_sees_429_from_throttled_server() {
         let profile = NetworkProfile { req_per_sec: Some(1), ..NetworkProfile::local_node() };
-        let addr = server::spawn(node(10), profile, 0).await;
+        let addr = server::spawn(node(10), profile, 0).await.unwrap();
         let rpc = client(addr);
         let _ = rpc.tip_height().await; // consumes the 1/sec budget
         match rpc.tip_height().await {
-            Err(RpcError::HttpStatus { status: 429, .. }) | Err(RpcError::Auth) => {}
+            Err(RpcError::HttpStatus { status: 429, .. }) => {}
             other => panic!("expected 429 surfaced by real client, got {other:?}"),
         }
     }
