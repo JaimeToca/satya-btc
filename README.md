@@ -37,9 +37,11 @@ There are two common ways to answer it, and both are unsatisfying:
   reflect what a miner would assemble *right now* — so exactly when the mempool
   is moving fastest (a fee spike, a block boundary), it hands you a stale-low
   number, and a too-low fee is what leaves a transaction stuck.
-- **A third-party fee API** is accurate but requires **trusting someone else's
-  view** of the network, and leaks which fees and transactions you care about to
-  a provider that sees every request.
+- **A third-party fee API** is accurate but costs you **trust and privacy.** You
+  take a provider's word for the state of the network instead of verifying it
+  yourself, and every request tells them which transactions and fee levels you
+  care about — a live feed of your intentions, and a single point of failure the
+  moment their view is wrong, throttled, or offline.
 
 The accurate, trustless way is to **simulate the next blocks from the *live*
 mempool the way a miner does** — rank transactions by their real, CPFP-aware
