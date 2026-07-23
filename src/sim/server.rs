@@ -1,0 +1,230 @@
+//! Serves a [`MockNode`] over a real HTTP JSON-RPC endpoint (axum), with a
+//! [`NetworkProfile`] applied, so the REAL reqwest [`crate::rpc::Rpc`] client
+//! is exercised end-to-end (body streaming, timeouts, 429 classification)
+//! entirely offline. Reached via the feature-gated `sim-serve` entrypoint
+//! (`run_cli`, invoked from `main.rs` before the normal indexer boots).
+
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::{Json, Router};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use crate::sim::network::{check_rate_limit, Limiter};
+use crate::sim::{ChurnConfig, FeeDistribution, MockNode, NetworkProfile};
+
+/// Shared server state: the churning node behind a plain (non-async) mutex —
+/// every handler access is a brief lock-snapshot-unlock, never held across an
+/// `.await` — plus the rate limiter (same discipline) and the profile
+/// (immutable after startup, so no lock needed for it).
+struct ServerState {
+    node: Mutex<MockNode>,
+    limiter: Mutex<Limiter>,
+    profile: NetworkProfile,
+}
+
+#[derive(Deserialize)]
+struct JsonRpcRequest {
+    method: String,
+    #[serde(default)]
+    params: Vec<Value>,
+}
+
+/// Bind a `MockNode` behind an HTTP JSON-RPC endpoint (Core-shaped), gated by
+/// `profile`'s rate limit. `port = 0` picks an ephemeral free port. Spawns the
+/// axum server task AND a background churn timer (advances the node every 2s)
+/// on the current tokio runtime, then returns the bound address.
+pub async fn spawn(node: MockNode, profile: NetworkProfile, port: u16) -> SocketAddr {
+    let state = Arc::new(ServerState {
+        node: Mutex::new(node),
+        limiter: Mutex::new(Limiter::new()),
+        profile,
+    });
+
+    let app = Router::new()
+        .route("/", post(handle_rpc))
+        .with_state(state.clone());
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // Keep the mempool alive: advance churn on a fixed tick so a client
+    // watching the live server sees arrivals/evictions over time.
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            let mut n = state.node.lock().unwrap();
+            n.advance();
+        }
+    });
+
+    addr
+}
+
+async fn handle_rpc(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<JsonRpcRequest>,
+) -> Response {
+    // Rate-limit gate first, mirroring `SimulatedRpc::gate`: lock briefly,
+    // check/book the window, release — never held across an `.await`.
+    if let Some(limit) = state.profile.req_per_sec {
+        let within_budget = {
+            let mut limiter = state.limiter.lock().unwrap();
+            check_rate_limit(&mut limiter, limit, Instant::now())
+        };
+        if !within_budget {
+            // Empty body (not a JSON-RPC envelope) so the real client's `call`
+            // classifies this as `RpcError::HttpStatus { status: 429, .. }`
+            // rather than trying to parse a `{result,error}` envelope.
+            return (StatusCode::TOO_MANY_REQUESTS, "").into_response();
+        }
+    }
+
+    if state.profile.latency > Duration::ZERO {
+        tokio::time::sleep(state.profile.latency).await;
+    }
+
+    dispatch(&state, &req.method, &req.params).await
+}
+
+async fn dispatch(state: &ServerState, method: &str, params: &[Value]) -> Response {
+    match method {
+        "getblockchaininfo" => {
+            let tip_height = {
+                let n = state.node.lock().unwrap();
+                n.tip_height_sync()
+            };
+            ok_response(json!({ "chain": "main", "blocks": tip_height }))
+        }
+        "getmempoolinfo" => ok_response(json!({
+            "loaded": true,
+            "mempoolminfee": 0.00001,
+        })),
+        "getrawmempool" => {
+            let verbose = params.first().and_then(Value::as_bool).unwrap_or(false);
+            let entries = {
+                let n = state.node.lock().unwrap();
+                n.snapshot_entries()
+            };
+            if verbose {
+                let map: serde_json::Map<String, Value> = entries
+                    .into_iter()
+                    .map(|(txid, entry)| (txid.to_string(), verbose_entry_json(&entry)))
+                    .collect();
+                ok_response(Value::Object(map))
+            } else {
+                let txids: Vec<String> = entries.into_iter().map(|(txid, _)| txid.to_string()).collect();
+                ok_response(json!(txids))
+            }
+        }
+        "getmempoolentry" => {
+            let txid_str = params.first().and_then(Value::as_str).unwrap_or_default();
+            let entry = match txid_str.parse::<bitcoin::Txid>() {
+                Ok(txid) => {
+                    let n = state.node.lock().unwrap();
+                    n.entry_by_txid(&txid)
+                }
+                Err(_) => None,
+            };
+            match entry {
+                Some(e) => ok_response(verbose_entry_json(&e)),
+                None => Json(json!({
+                    "result": null,
+                    "error": { "code": -5, "message": "Transaction not in mempool" },
+                    "id": 0,
+                }))
+                .into_response(),
+            }
+        }
+        other => Json(json!({
+            "result": null,
+            "error": { "code": -32601, "message": format!("Method not found: {other}") },
+            "id": 0,
+        }))
+        .into_response(),
+    }
+}
+
+fn ok_response(result: Value) -> Response {
+    Json(json!({ "result": result, "error": null, "id": 0 })).into_response()
+}
+
+fn verbose_entry_json(e: &crate::rpc::MempoolEntry) -> Value {
+    json!({
+        "vsize": e.vsize,
+        "weight": e.weight,
+        "depends": Vec::<String>::new(),
+        "fees": {
+            "base": e.fees.base.to_btc(),
+            "ancestor": e.fees.ancestor.to_btc(),
+            "descendant": e.fees.descendant.to_btc(),
+        },
+        "ancestorsize": e.ancestorsize,
+        "descendantsize": e.descendantsize,
+    })
+}
+
+/// Small `clap::Parser` scoped to the `sim-serve` entrypoint, parsed manually
+/// from `main.rs` (the production CLI in `config.rs` is env-var driven and is
+/// left untouched; see `main.rs` for the `sim-serve` dispatch guard).
+#[derive(clap::Parser)]
+#[command(name = "sim-serve")]
+struct SimServeArgs {
+    #[arg(long, default_value_t = 18443)]
+    port: u16,
+    #[arg(long, default_value_t = 20_000)]
+    size: usize,
+    #[arg(long, default_value_t = 600)]
+    arrivals: usize,
+    #[arg(long, default_value_t = 600)]
+    evictions: usize,
+    /// remote = getblock_remote profile; anything else = local_node.
+    #[arg(long, default_value = "remote")]
+    profile: String,
+}
+
+/// Entry point for `main.rs`'s `sim-serve` guard: parses the sim flags,
+/// builds the `MockNode` + `NetworkProfile`, spawns the server, logs the
+/// bound address, and blocks forever (the churn timer inside `spawn` keeps
+/// the mempool alive).
+pub async fn run_cli() -> anyhow::Result<()> {
+    use clap::Parser;
+    // `env::args()` includes the `sim-serve` token itself as argv[1]; clap
+    // expects argv[0] to be the program name, so splice a placeholder in.
+    let rest = std::env::args().skip(2);
+    let args = std::iter::once("sim-serve".to_string()).chain(rest);
+    let args = SimServeArgs::parse_from(args);
+
+    let churn = ChurnConfig {
+        arrivals_per_tick: args.arrivals,
+        evictions_per_tick: args.evictions,
+        fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 500 },
+    };
+    let node = MockNode::new(0, args.size, churn);
+    let profile = if args.profile == "remote" {
+        NetworkProfile::getblock_remote()
+    } else {
+        NetworkProfile::local_node()
+    };
+
+    let addr = spawn(node, profile, args.port).await;
+    tracing::info!(%addr, "sim node serving; point BTC_RPC_URL at it");
+    std::future::pending::<anyhow::Result<()>>().await
+}
+
+#[cfg(test)]
+#[path = "server_tests.rs"]
+mod server_tests;

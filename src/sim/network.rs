@@ -34,9 +34,31 @@ impl NetworkProfile {
 
 /// Fixed-window per-second limiter. Shared across clones so one budget governs
 /// all concurrent calls (mirrors a real provider's account-wide limit).
-struct Limiter {
+pub(crate) struct Limiter {
     window_start: Instant,
     count: u32,
+}
+
+impl Limiter {
+    pub(crate) fn new() -> Self {
+        Self { window_start: Instant::now(), count: 0 }
+    }
+}
+
+/// Fixed-window per-second rate check, shared by `SimulatedRpc::gate` and the
+/// HTTP sim server (`sim::server`) so the two callers can't drift. Returns
+/// `true` if the call is within budget (and books it against the window),
+/// `false` if the window's budget is already exhausted.
+pub(crate) fn check_rate_limit(limiter: &mut Limiter, limit: u32, now: Instant) -> bool {
+    if now.duration_since(limiter.window_start) >= Duration::from_secs(1) {
+        limiter.window_start = now;
+        limiter.count = 0;
+    }
+    if limiter.count >= limit {
+        return false;
+    }
+    limiter.count += 1;
+    true
 }
 
 struct Shared {
@@ -57,7 +79,7 @@ impl<N: MempoolRpc> SimulatedRpc<N> {
             inner,
             profile,
             shared: Arc::new(Mutex::new(Shared {
-                limiter: Limiter { window_start: Instant::now(), count: 0 },
+                limiter: Limiter::new(),
                 rng: StdRng::seed_from_u64(0x5A7A),
             })),
         }
@@ -77,17 +99,12 @@ impl<N: MempoolRpc> SimulatedRpc<N> {
                 });
             }
             if let Some(limit) = self.profile.req_per_sec {
-                if s.limiter.window_start.elapsed() >= Duration::from_secs(1) {
-                    s.limiter.window_start = Instant::now();
-                    s.limiter.count = 0;
-                }
-                if s.limiter.count >= limit {
+                if !check_rate_limit(&mut s.limiter, limit, Instant::now()) {
                     return Err(RpcError::HttpStatus {
                         status: 429,
                         body: String::new(),
                     });
                 }
-                s.limiter.count += 1;
             }
         }
         Ok(())

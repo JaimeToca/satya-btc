@@ -101,6 +101,24 @@ impl MockNode {
         self.txs.is_empty()
     }
 
+    /// Synchronous snapshot accessors for callers that can't `.await` while
+    /// holding a lock on the node (e.g. `sim::server`'s handler, which must
+    /// release its `std::sync::Mutex<MockNode>` guard before building a JSON
+    /// response). These mirror the `MempoolRpc` methods but return plain
+    /// values instead of `Result<_, RpcError>` futures, since `MockNode`
+    /// never actually fails or awaits internally.
+    pub fn tip_height_sync(&self) -> u64 {
+        self.tip_height
+    }
+
+    pub fn snapshot_entries(&self) -> Vec<(Txid, MempoolEntry)> {
+        self.txs.iter().map(|(k, v)| (*k, clone_entry(v))).collect()
+    }
+
+    pub fn entry_by_txid(&self, txid: &Txid) -> Option<MempoolEntry> {
+        self.txs.get(txid).map(clone_entry)
+    }
+
     /// Build one synthetic `(Txid, MempoolEntry)` with a fresh random txid and
     /// internally-consistent size/fee/package fields.
     fn gen_entry(&mut self) -> (Txid, MempoolEntry) {

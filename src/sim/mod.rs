@@ -13,6 +13,7 @@
 
 pub mod mock_node;
 pub mod network;
+pub mod server;
 
 // Consumed by later sim tasks (`crate::sim::{...}` in network.rs / sync sim
 // tests / the HTTP server). Scoped allow on just this re-export so an unused
