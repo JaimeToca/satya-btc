@@ -57,6 +57,23 @@ Redis, multiple node backends). Satya keeps the estimator and drops the rest of
 the explorer, so what you run and operate is just the fee engine — self-hosted,
 private, and trivial to deploy.
 
+Being small also lets it be built the way a piece of money infrastructure should
+be:
+
+- **Written in Rust.** Memory-safe with no garbage-collector pauses, and fees are
+  kept as exact integer satoshis end-to-end — never floating point — so there's no
+  rounding drift in the numbers you act on.
+- **One static binary, zero services.** No database, no Redis, no message broker,
+  no runtime to install. It's a single async [Tokio](https://tokio.rs) process you
+  drop next to your node; deploy it as a lone executable or a tiny container.
+- **Cheap and low-footprint.** Because it holds only the live mempool in memory and
+  talks to nothing but your node, it runs comfortably on the same modest,
+  low-disk (pruned / `assumeutxo`) box as the node itself.
+- **Hardened and honest by design.** The RPC transport is bounded against an
+  untrusted endpoint (streaming body caps, timeouts, cancel-on-drop, no redirects,
+  no token leaks), and the system refuses to lie about freshness — `/health`
+  reports `caught_up=false` rather than serve a stale number as if it were live.
+
 ---
 
 ## System design
