@@ -84,19 +84,6 @@ is an infinite loop that only ends via panic; if it ever does, the process
 silently freezing while still cheerfully serving `/health`. A frozen-but-healthy
 process is worse than a clean crash.
 
-### Components
-
-| Module          | Responsibility                                                          |
-|-----------------|-------------------------------------------------------------------------|
-| `config`        | Parse configuration from environment variables / CLI flags.             |
-| `rpc`           | Async JSON-RPC client over `reqwest` (auth, timeouts, body caps, calls).|
-| `mempool`       | The `MempoolTx` / `MempoolState` model and the diff/apply logic.        |
-| `sync/mod`      | The poll loop: cold-load, steady-state diff, restart guard, budget bail.|
-| `sync/decision` | The **pure** desync/backlog/cooldown logic — no I/O, unit-tested.       |
-| `http`          | The axum router and the `/health` handler.                              |
-| `zmq`           | Optional `zmqpubhashblock` listener that wakes the loop on a new block. |
-| `main`          | Wire config → shared state → sync task → HTTP server, with supervision. |
-
 The rest of this document walks through the three pieces that make Satya work:
 **building the mempool**, **talking to the node**, and **simulating the next
 blocks to estimate fees**.
