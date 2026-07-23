@@ -11,7 +11,6 @@ off that simulation. One static binary. No database, no Redis, no explorer.
 ## Contents
 
 - [Why Satya exists](#why-satya-exists)
-  - [How Satya differs from mempool.space](#how-satya-differs-from-mempoolspace)
 - [System design](#system-design)
 - [Building the mempool](#building-the-mempool)
 - [Talking to the node: the JSON-RPC transport](#talking-to-the-node-the-json-rpc-transport)
@@ -45,38 +44,15 @@ mempool the way a miner does** — rank transactions by their real, CPFP-aware
 effective fee rate, pack them into projected blocks under the real weight limit,
 and read the fee tiers off the boundaries.
 
-### How Satya differs from mempool.space
-
-Block-template fee estimation isn't exotic: it's the same logic Bitcoin Core runs
-in `getblocktemplate` to assemble a block, applied to fee estimation instead of
-mining. [mempool.space](https://mempool.space) is the best-known service built on
-it, so it's the natural point of comparison — and it's a useful cross-check for
-the open-source `rust-gbt` version of the algorithm.
-
-The difference is **scope**. mempool.space is a full **block explorer** — a whole
-platform — where fee estimation is one small organ inside a much larger organism:
-
-| mempool.space (the platform)                     | Satya                              |
-|--------------------------------------------------|------------------------------------|
-| Block + address explorer, analytics, mining dashboards, Lightning, RBF/accelerator tooling | Just the fee estimator |
-| A backend database, Redis, and multiple node backends | Nothing but your Bitcoin Core node |
-| Many services to deploy and operate              | One static binary                  |
-| A public site you can also self-host (heavy)     | Purpose-built to self-host (light) |
-
-Satya extracts **only that one organ** — a live mempool plus a block-template
-simulation, producing fee tiers — and throws the rest away:
-
-- **Lightweight.** A single static binary. No database, no Redis, no explorer,
-  no message bus. It talks to exactly one thing: your node's JSON-RPC endpoint.
-- **Self-hosted and trustless.** Your node, your numbers. Nobody else sees which
-  fees you query, and you never take a third party's word for the state of the
-  network.
-- **Purpose-built.** One job — the fee-estimation core — done well, rather than
-  a general-purpose explorer you have to operate.
-
-This is the reason the repo exists. It is not a clone; it is the *subtraction* of
-everything that isn't the fee number — the same core idea, distilled to a tool you
-can run yourself in one process.
+This is the same block-template approach [mempool.space](https://mempool.space)
+is best known for — it's really just Bitcoin Core's own `getblocktemplate` logic
+pointed at fee estimation instead of mining. The difference is **scope**:
+mempool.space is a full block explorer (analytics, mining dashboards, Lightning,
+a database, Redis, multiple node backends), where fee estimation is one small
+organ. Satya is **only that organ** — a single static binary that talks to
+nothing but your own Bitcoin Core node, computes the fee tiers, and throws the
+rest of the explorer away. Same core idea, distilled to a tool you can run
+yourself in one process.
 
 ---
 
