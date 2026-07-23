@@ -25,6 +25,14 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 futures = "0.3"
 zeromq = "0.6.0"
+# Seeded RNG for the simulation harness only (behind the `simulation` feature).
+rand = { version = "0.8", optional = true }
+
+[features]
+# Compiles the offline mempool/network simulation harness (MockNode,
+# SimulatedRpc, the sim HTTP server, and their tests). Off by default so the
+# release build ships none of it.
+simulation = ["dep:rand"]
 
 # Lean production binary: link-time optimization across crates and a single
 # codegen unit trade longer compile time for a smaller, faster release build.

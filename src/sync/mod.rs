@@ -1,9 +1,11 @@
 mod decision;
+#[cfg(all(test, feature = "simulation"))]
+mod sim_tests;
 
 use crate::mempool::{
     self, compute_diff, read_state, write_state, MempoolState, MempoolTx, SharedState,
 };
-use crate::rpc::{self, Rpc, RpcError};
+use crate::rpc::{self, MempoolRpc, RpcError};
 use bitcoin::Txid;
 use decision::{
     decide_desync, is_backlog, projected_mempool_size, resync_cooling_down, DesyncAction,
@@ -36,7 +38,7 @@ fn short_err<E: std::fmt::Display>(e: &E) -> String {
 /// mempool (triggering a mass-drop resync) AND rotates the cookie, so without
 /// this the startup loop, steady-state ticks, and bulk resyncs would all wedge
 /// on 401 forever. Non-reconnectable errors are left alone.
-fn reconnect_on_error(rpc: &mut Rpc, e: &RpcError) {
+fn reconnect_on_error<R: MempoolRpc + Clone + Send + Sync + 'static>(rpc: &mut R, e: &RpcError) {
     if rpc::is_reconnectable(e) {
         if let Err(re) = rpc.reconnect() {
             tracing::warn!(error = %short_err(&re), "rpc reconnect failed");
@@ -132,8 +134,8 @@ struct FetchBatchResult {
 /// Async sync loop; spawn on the tokio runtime. Never returns under normal
 /// operation. `wake_rx` lets a future ZMQ block event (Task 5) trigger an
 /// immediate steady-state tick instead of waiting out the poll interval.
-pub async fn run(
-    mut rpc: Rpc,
+pub async fn run<R: MempoolRpc + Clone + Send + Sync + 'static>(
+    mut rpc: R,
     state: SharedState,
     cfg: SyncConfig,
     mut wake_rx: tokio::sync::mpsc::Receiver<()>,
@@ -181,7 +183,10 @@ pub async fn run(
 /// Startup gate: poll `mempool_info` until the node reports its mempool has
 /// finished loading, then return. Older nodes don't report `loaded`; treat that
 /// as loaded.
-async fn wait_until_mempool_loaded(rpc: &mut Rpc, poll: Duration) {
+async fn wait_until_mempool_loaded<R: MempoolRpc + Clone + Send + Sync + 'static>(
+    rpc: &mut R,
+    poll: Duration,
+) {
     loop {
         match rpc.mempool_info().await {
             // Older nodes don't report `loaded` at all; treat that as loaded.
@@ -203,8 +208,8 @@ async fn wait_until_mempool_loaded(rpc: &mut Rpc, poll: Duration) {
 /// Cold-start: retry `bulk_resync` until one succeeds, then return the
 /// `last_bulk_resync` instant (stamped AFTER the successful bulk, so the first
 /// cooldown window starts from load completion). Only returns after a success.
-async fn initial_bulk_load(
-    rpc: &mut Rpc,
+async fn initial_bulk_load<R: MempoolRpc + Clone + Send + Sync + 'static>(
+    rpc: &mut R,
     state: &SharedState,
     poll: Duration,
     caught_up_prev: &mut bool,
@@ -225,8 +230,8 @@ async fn initial_bulk_load(
 /// One steady-state tick: read node state, react to desync, else diff/fetch and
 /// update the cache. `caught_up_prev` and `last_bulk_resync` are threaded by
 /// `&mut` and mutated in place across ticks.
-async fn steady_tick(
-    rpc: &mut Rpc,
+async fn steady_tick<R: MempoolRpc + Clone + Send + Sync + 'static>(
+    rpc: &mut R,
     state: &SharedState,
     cfg: &SyncConfig,
     caught_up_prev: &mut bool,
@@ -344,6 +349,19 @@ async fn steady_tick(
     // log field.
     let mempool_size = projected_mempool_size(cache_len, diff.gone.len(), res.fetched.len());
 
+    // Per-tick building summary. `debug` so `info` prod runs stay quiet, but
+    // `RUST_LOG=satya::sync=debug` shows the mempool churn live: how many txids
+    // the node added/removed this tick, how many we fetched, the running size,
+    // and whether we're keeping up.
+    tracing::debug!(
+        new = diff.new.len(),
+        gone = diff.gone.len(),
+        fetched = res.fetched.len(),
+        size = mempool_size,
+        backlog,
+        "mempool tick"
+    );
+
     {
         let mut g = write_state(state);
         for (txid, tx) in res.fetched {
@@ -370,8 +388,8 @@ async fn steady_tick(
 /// over (capped, dropped in-flight on budget bail, or errored) stays absent from
 /// the cache, so it's still in `diff.new` (and gets fetched) next tick — nothing
 /// is permanently lost.
-async fn fetch_new_entries(
-    rpc: &Rpc,
+async fn fetch_new_entries<R: MempoolRpc + Clone + Send + Sync + 'static>(
+    rpc: &R,
     new_txids: &[Txid],
     concurrency: usize,
     tick_budget: Duration,
@@ -457,7 +475,10 @@ async fn fetch_new_entries(
 /// This does NOT set the freshness flags (`caught_up`, `last_sync_ok`): the
 /// caller owns both (via `apply_bulk_success`) so they're set together under one
 /// lock and `/health` never sees a full mempool with `caught_up` still false.
-async fn bulk_resync(rpc: &mut Rpc, state: &SharedState) -> Option<usize> {
+async fn bulk_resync<R: MempoolRpc + Clone + Send + Sync + 'static>(
+    rpc: &mut R,
+    state: &SharedState,
+) -> Option<usize> {
     let entries = match rpc.raw_mempool_verbose().await {
         Ok(entries) => entries,
         Err(e) => {

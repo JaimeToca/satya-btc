@@ -26,9 +26,13 @@ check:
 clippy:
     cargo clippy --all-targets
 
-# Run unit tests
+# Run unit tests (simulation harness included)
 test:
-    cargo test
+    cargo test --features simulation
+
+# Run the offline simulated node (needs `--features simulation`)
+simulate:
+    cargo run --features simulation -- sim-serve
 
 # Format the code
 fmt:

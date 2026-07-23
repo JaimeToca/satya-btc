@@ -4,6 +4,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::SystemTime;
 
+// The cache stores full per-tx package data, but no consumer reads these fields
+// yet — the GBT fee estimator (`/fees`) that will read them is not built. The
+// fields are populated and carried deliberately as its data substrate (and are
+// exercised by the simulation harness), so silence the write-only `dead_code`
+// lint here rather than dropping data we're about to need.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MempoolTx {
     pub vsize: u32,

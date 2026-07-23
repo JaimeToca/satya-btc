@@ -2,6 +2,8 @@ mod config;
 mod http;
 mod mempool;
 mod rpc;
+#[cfg(feature = "simulation")]
+mod sim;
 mod sync;
 mod zmq;
 
@@ -15,6 +17,20 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    // Feature-gated `sim-serve` entrypoint: serves an offline MockNode over
+    // HTTP instead of booting the real indexer. The production CLI
+    // (`config::Config::from_env`) is a flat env-var-driven clap struct with
+    // no subcommand support, so this is dispatched by inspecting argv
+    // directly rather than adding a subcommand to it.
+    #[cfg(feature = "simulation")]
+    {
+        let mut args = std::env::args();
+        let _bin = args.next();
+        if args.next().as_deref() == Some("sim-serve") {
+            return sim::server::run_cli().await;
+        }
+    }
 
     let cfg = config::Config::from_env()?;
     let mut rpc = rpc::Rpc::connect(&cfg.rpc)?;
