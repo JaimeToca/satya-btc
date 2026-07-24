@@ -101,11 +101,17 @@ fn apply_bulk_success(state: &SharedState, caught_up_prev: &mut bool, count: usi
 }
 
 /// Recompute the fee estimate if at least `min_interval` has passed since the
-/// last recompute. Snapshots the tx fields the projector needs under a read
-/// lock, runs the CPU-bound projection on the blocking pool, then stores the
-/// result. `last` is advanced only when a recompute actually runs.
-async fn maybe_recompute_fees(state: &SharedState, last: &mut Instant, min_interval: Duration) {
-    if last.elapsed() < min_interval {
+/// last recompute, or unconditionally when `force` is set. Snapshots the tx
+/// fields the projector needs under a read lock, runs the CPU-bound
+/// projection on the blocking pool, then stores the result. `last` is
+/// advanced only when a recompute actually runs.
+async fn maybe_recompute_fees(
+    state: &SharedState,
+    last: &mut Instant,
+    min_interval: Duration,
+    force: bool,
+) {
+    if !force && last.elapsed() < min_interval {
         return;
     }
     let (mut snapshot, min_fee) = {
@@ -203,6 +209,7 @@ pub async fn run<R: MempoolRpc + Clone + Send + Sync + 'static>(
         &state,
         &mut last_fee_recompute,
         cfg.fee_recompute_min_interval,
+        true,
     )
     .await;
 
@@ -361,6 +368,7 @@ async fn steady_tick<R: MempoolRpc + Clone + Send + Sync + 'static>(
                             state,
                             last_fee_recompute,
                             cfg.fee_recompute_min_interval,
+                            true,
                         )
                         .await;
                     }
@@ -446,7 +454,13 @@ async fn steady_tick<R: MempoolRpc + Clone + Send + Sync + 'static>(
     // now would risk later serving a stale estimate as `200/caught_up` if the
     // throttle skips the next (post-catch-up) recompute.
     if !backlog {
-        maybe_recompute_fees(state, last_fee_recompute, cfg.fee_recompute_min_interval).await;
+        maybe_recompute_fees(
+            state,
+            last_fee_recompute,
+            cfg.fee_recompute_min_interval,
+            false,
+        )
+        .await;
     }
 }
 
