@@ -112,6 +112,14 @@ pub struct MempoolEntry {
     pub fees: MempoolEntryFees,
     pub ancestorsize: u64,
     pub descendantsize: u64,
+    /// Unix time (seconds) the tx entered the NODE's mempool, from Core's
+    /// `getmempoolentry`/verbose `getrawmempool`. This is the node's clock, not
+    /// ours, so it survives our restarts and is identical whichever fetch path
+    /// (per-tx entry vs bulk verbose) produced it. Optional so a single missing
+    /// `time` (older/alt stacks) doesn't fail the whole verbose-mempool decode;
+    /// the `From` impl falls back to `0` ("unknown"). Present on all supported
+    /// Core (≥ 0.16).
+    pub time: Option<u64>,
 }
 
 /// The `fees` sub-object of a mempool entry. Core reports each as BTC decimals;
