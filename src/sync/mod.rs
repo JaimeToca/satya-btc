@@ -108,7 +108,7 @@ async fn maybe_recompute_fees(state: &SharedState, last: &mut Instant, min_inter
     if last.elapsed() < min_interval {
         return;
     }
-    let (snapshot, min_fee) = {
+    let (mut snapshot, min_fee) = {
         let g = read_state(state);
         let snapshot: Vec<(Txid, u64, u32, Vec<Txid>)> = g
             .txs
@@ -117,6 +117,10 @@ async fn maybe_recompute_fees(state: &SharedState, last: &mut Instant, min_inter
             .collect();
         (snapshot, g.mempool_min_fee_sat_vb)
     };
+    // Deterministic ordering: `g.txs` is a `HashMap`, so iteration order (and
+    // thus dense uid assignment / the projection's tie-breaks) would otherwise
+    // vary run-to-run for the same mempool contents.
+    snapshot.sort_by(|a, b| a.0.cmp(&b.0));
     match tokio::task::spawn_blocking(move || crate::fees::compute_estimate(&snapshot, min_fee))
         .await
     {
@@ -192,6 +196,15 @@ pub async fn run<R: MempoolRpc + Clone + Send + Sync + 'static>(
     let mut last_fee_recompute = Instant::now()
         .checked_sub(cfg.fee_recompute_min_interval)
         .unwrap_or_else(Instant::now);
+
+    // Populate the estimate immediately after the cold load completes, so
+    // `/fees` isn't 503 for a full poll interval despite `caught_up = true`.
+    maybe_recompute_fees(
+        &state,
+        &mut last_fee_recompute,
+        cfg.fee_recompute_min_interval,
+    )
+    .await;
 
     // --- Steady-state loop. ---
     // Per-tick fetch concurrency is bounded by `buffer_unordered` in
@@ -428,8 +441,13 @@ async fn steady_tick<R: MempoolRpc + Clone + Send + Sync + 'static>(
         }
     }
 
-    // Refresh the fee estimate from the just-applied mempool (throttled).
-    maybe_recompute_fees(state, last_fee_recompute, cfg.fee_recompute_min_interval).await;
+    // Refresh the fee estimate from the just-applied mempool (throttled). Skip
+    // while backlogged: the cache is known-incomplete this tick, so recomputing
+    // now would risk later serving a stale estimate as `200/caught_up` if the
+    // throttle skips the next (post-catch-up) recompute.
+    if !backlog {
+        maybe_recompute_fees(state, last_fee_recompute, cfg.fee_recompute_min_interval).await;
+    }
 }
 
 /// Fetch full details for (a capped slice of) this tick's new txids, best-effort,

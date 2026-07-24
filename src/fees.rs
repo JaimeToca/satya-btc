@@ -31,9 +31,10 @@ fn now_unix() -> u64 {
 }
 
 /// Block weight used to convert cumulative weight into a projected-block depth.
-/// The consensus block weight limit; the small coinbase reserve is immaterial to
-/// tier boundaries.
-const TIER_BLOCK_WEIGHT: u64 = gbt::MAX_BLOCK_WEIGHT as u64;
+/// Matches the per-block tx-weight budget the projection actually packs
+/// against (consensus weight limit minus the coinbase reserve), rather than
+/// the full consensus limit, removing a ~0.1% optimistic bias in tier depth.
+const TIER_BLOCK_WEIGHT: u64 = (gbt::MAX_BLOCK_WEIGHT - gbt::BLOCK_RESERVED_WEIGHT) as u64;
 
 // Projected-block depth (1-based) each time tier corresponds to (~10-min blocks).
 const FASTEST_DEPTH: u64 = 1;

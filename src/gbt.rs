@@ -65,7 +65,8 @@ fn rate(fee: u64, weight: u64) -> f64 {
 }
 
 /// Current score of a tx: `min(own_rate, package_rate)` over its not-yet-used
-/// ancestors. Scores only ever need recomputing as ancestors get `used`.
+/// ancestors. Scores can move either way as ancestors get `used` (see
+/// `refresh_descendants`), so this must be recomputed rather than cached.
 fn score_of(uid: u32, audits: &[Audit], used: &[bool]) -> f64 {
     let a = &audits[uid as usize];
     let own = rate(a.fee, a.weight as u64);
@@ -152,8 +153,11 @@ fn project_with(
 
     // Transitive ancestor closures (memoized DFS; depth bounded by policy limits).
     let mut memo: Vec<Option<Vec<u32>>> = vec![None; n];
+    // Tracks the current DFS recursion stack so a corrupt/malicious `depends`
+    // cycle can't cause unbounded recursion; see `build_ancestors`.
+    let mut visiting: Vec<bool> = vec![false; n];
     for uid in 0..n as u32 {
-        let anc = build_ancestors(uid, &txs, &mut memo);
+        let anc = build_ancestors(uid, &txs, &mut memo, &mut visiting);
         audits[uid as usize].ancestors = anc;
     }
 
@@ -170,7 +174,7 @@ fn project_with(
     let mut blocks: Vec<Vec<u32>> = Vec::new();
     let mut effective_rates: HashMap<u32, f64> = HashMap::new();
     let mut cur_block: Vec<u32> = Vec::new();
-    let mut block_weight: u32 = reserved;
+    let mut block_weight: u64 = reserved as u64;
     let mut overflow: Vec<u32> = Vec::new();
     let mut failures: u32 = 0;
 
@@ -209,13 +213,13 @@ fn project_with(
         });
         pkg.push(uid);
 
-        let pkg_weight: u32 = pkg.iter().map(|&m| audits[m as usize].weight).sum();
+        let pkg_weight: u64 = pkg.iter().map(|&m| audits[m as usize].weight as u64).sum();
         let pkg_fee: u64 = pkg.iter().map(|&m| audits[m as usize].fee).sum();
 
         let bounded = blocks.len() < max_blocks.saturating_sub(1);
         if bounded
             && !cur_block.is_empty()
-            && block_weight.saturating_add(pkg_weight) > max_block_weight
+            && block_weight.saturating_add(pkg_weight) > max_block_weight as u64
         {
             // Doesn't fit the current partial block; hold it and try smaller
             // packages that might. If `cur_block` were empty here, this package
@@ -225,11 +229,11 @@ fn project_with(
             overflow.push(uid);
             failures += 1;
         } else {
-            let cluster_rate = rate(pkg_fee, pkg_weight as u64);
+            let cluster_rate = rate(pkg_fee, pkg_weight);
             for &m in &pkg {
                 used[m as usize] = true;
                 cur_block.push(m);
-                block_weight += audits[m as usize].weight;
+                block_weight += audits[m as usize].weight as u64;
                 effective_rates.insert(m, cluster_rate);
             }
             refresh_descendants(&pkg, &audits, &used, &mut heap);
@@ -241,7 +245,7 @@ fn project_with(
         let bounded = blocks.len() < max_blocks.saturating_sub(1);
         if bounded && (failures > FAILURE_LIMIT || heap.is_empty()) && !cur_block.is_empty() {
             blocks.push(std::mem::take(&mut cur_block));
-            block_weight = reserved;
+            block_weight = reserved as u64;
             failures = 0;
             for &o in &overflow {
                 heap.push(HeapItem {
@@ -265,25 +269,43 @@ fn project_with(
 }
 
 /// Memoized transitive ancestor closure for `uid`.
-fn build_ancestors(uid: u32, txs: &[GbtTx], memo: &mut Vec<Option<Vec<u32>>>) -> Vec<u32> {
+fn build_ancestors(
+    uid: u32,
+    txs: &[GbtTx],
+    memo: &mut Vec<Option<Vec<u32>>>,
+    visiting: &mut Vec<bool>,
+) -> Vec<u32> {
     if let Some(a) = &memo[uid as usize] {
         return a.clone();
     }
+    // Bitcoin tx graphs are acyclic, but a corrupt/malicious RPC `depends` could
+    // form a cycle; if `uid` is already on the current recursion stack, treat
+    // the back-edge as absent instead of recursing forever.
+    if visiting[uid as usize] {
+        return Vec::new();
+    }
+    visiting[uid as usize] = true;
     let mut set: HashSet<u32> = HashSet::new();
     for &p in &txs[uid as usize].parents {
         set.insert(p);
-        for a in build_ancestors(p, txs, memo) {
+        for a in build_ancestors(p, txs, memo, visiting) {
             set.insert(a);
         }
     }
+    visiting[uid as usize] = false;
     let v: Vec<u32> = set.into_iter().collect();
     memo[uid as usize] = Some(v.clone());
     v
 }
 
 /// After a package is used, re-push refreshed scores for its whole descendant
-/// closure: including an ancestor raises a descendant's effective rate, so its
-/// stale (lower) heap entry must be superseded by a corrected one.
+/// closure. Including a package can move a descendant's score either way: in a
+/// diamond DAG, a high-rate ancestor consumed by a sibling package first can
+/// make a stranded descendant's score DROP, not just rise. Correctness and
+/// termination don't depend on the direction: a stale heap entry is always
+/// re-pushed with the corrected score (see the pop-loop's lazy refresh above),
+/// and `used` only ever grows, so the loop can't act on a stale key and always
+/// terminates.
 fn refresh_descendants(
     pkg: &[u32],
     audits: &[Audit],
