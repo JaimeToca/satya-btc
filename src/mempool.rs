@@ -83,6 +83,8 @@ pub struct MempoolState {
     pub network: Network,
     pub caught_up: bool,
     pub last_sync_ok: Option<SystemTime>,
+    /// Most recent computed fee estimate, or `None` before the first recompute.
+    pub fee_estimate: Option<crate::fees::FeeEstimate>,
 }
 
 impl MempoolState {
@@ -94,6 +96,7 @@ impl MempoolState {
             network,
             caught_up: false,
             last_sync_ok: None,
+            fee_estimate: None,
         }
     }
 }
@@ -160,5 +163,11 @@ mod tests {
         // a fake-recent stamp that would understate the tx's real age.
         let tx = MempoolTx::from(&entry_with_time(None));
         assert_eq!(tx.first_seen, 0);
+    }
+
+    #[test]
+    fn new_state_has_no_fee_estimate() {
+        let s = MempoolState::new(Network::Bitcoin);
+        assert!(s.fee_estimate.is_none());
     }
 }
