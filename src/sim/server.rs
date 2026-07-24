@@ -49,8 +49,12 @@ pub async fn spawn(
     node: MockNode,
     profile: NetworkProfile,
     port: u16,
+    block_secs: u64,
+    reload_every: u32,
 ) -> anyhow::Result<SocketAddr> {
     use anyhow::Context;
+
+    let _ = (block_secs, reload_every); // wired up in Task 3
 
     let state = Arc::new(ServerState {
         node: Mutex::new(node),
@@ -124,10 +128,16 @@ async fn dispatch(state: &ServerState, method: &str, params: &[Value]) -> Respon
             };
             ok_response(json!({ "chain": "main", "blocks": tip_height }))
         }
-        "getmempoolinfo" => ok_response(json!({
-            "loaded": true,
-            "mempoolminfee": 0.00001,
-        })),
+        "getmempoolinfo" => {
+            let loaded = {
+                let n = state.node.lock().unwrap();
+                n.loaded_sync()
+            };
+            ok_response(json!({
+                "loaded": loaded,
+                "mempoolminfee": 0.00001,
+            }))
+        }
         "getrawmempool" => {
             let verbose = params.first().and_then(Value::as_bool).unwrap_or(false);
             let entries = {
@@ -235,7 +245,7 @@ pub async fn run_cli() -> anyhow::Result<()> {
         NetworkProfile::local_node()
     };
 
-    let addr = spawn(node, profile, args.port).await?;
+    let addr = spawn(node, profile, args.port, 0, 0).await?;
     tracing::info!(%addr, "sim node serving; point BTC_RPC_URL at it");
     std::future::pending::<anyhow::Result<()>>().await
 }

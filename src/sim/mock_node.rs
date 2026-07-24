@@ -144,6 +144,14 @@ impl MockNode {
         self.tip_height
     }
 
+    /// Synchronous mirror of `mempool_info().loaded` for `sim::server`'s handler,
+    /// which reads node state under a `std::sync::Mutex` guard it must drop before
+    /// awaiting. `false` while a reload is pending (models a node still loading
+    /// its mempool after restart).
+    pub fn loaded_sync(&self) -> bool {
+        !self.reloading
+    }
+
     pub fn snapshot_entries(&self) -> Vec<(Txid, MempoolEntry)> {
         self.txs.iter().map(|(k, v)| (*k, clone_entry(v))).collect()
     }
