@@ -1,4 +1,5 @@
 mod config;
+mod fees;
 mod gbt;
 mod http;
 mod mempool;
