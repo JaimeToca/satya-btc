@@ -30,9 +30,9 @@ clippy:
 test:
     cargo test --features simulation
 
-# Run the offline simulated node (needs `--features simulation`)
+# Run the offline simulated node: blocks every 30s, mempool churn, on :18443
 simulate:
-    cargo run --features simulation -- sim-serve
+    cargo run --features simulation -- sim-serve --block-secs 30
 
 # Format the code
 fmt:
@@ -41,6 +41,24 @@ fmt:
 # curl the /health endpoint (needs `jq`)
 health:
     curl -s localhost:8080/health | jq
+
+# Run the REAL indexer against the sim node (unsets any real-node auth from .env)
+sim-run:
+    env -u BTC_RPC_COOKIE_FILE -u BTC_RPC_USER -u BTC_RPC_PASS \
+        BTC_RPC_URL=http://127.0.0.1:18443 cargo run
+
+# curl the /fees endpoint (needs `jq`)
+fees:
+    curl -s localhost:8080/fees | jq
+
+# Watch /health + /fees live, refreshing every 2s (portable; no `watch` needed)
+watch:
+    while true; do \
+        clear; \
+        echo '== /health =='; curl -s localhost:8080/health | jq; \
+        echo '== /fees =='; curl -s localhost:8080/fees | jq; \
+        sleep 2; \
+    done
 
 # Build and run via docker compose
 docker:
