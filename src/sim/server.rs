@@ -54,8 +54,6 @@ pub async fn spawn(
 ) -> anyhow::Result<SocketAddr> {
     use anyhow::Context;
 
-    let _ = (block_secs, reload_every); // wired up in Task 3
-
     let state = Arc::new(ServerState {
         node: Mutex::new(node),
         limiter: Mutex::new(Limiter::new()),
@@ -80,18 +78,47 @@ pub async fn spawn(
     });
 
     // Keep the mempool alive: advance churn on a fixed tick so a client
-    // watching the live server sees arrivals/evictions over time.
+    // watching the live server sees arrivals/evictions over time. On a
+    // configurable cadence, also mine a block (confirm top-fee txs, advance
+    // the tip) and — every `reload_every` blocks — simulate a node restart
+    // (mass-drop + loaded:false) so the indexer's resync path is exercised live.
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(2));
-        interval.tick().await; // consume the immediate first tick; first advance() is one period in
+        const CHURN_SECS: u64 = 2;
+        let tpb = ticks_per_block(block_secs, CHURN_SECS);
+        let mut interval = tokio::time::interval(Duration::from_secs(CHURN_SECS));
+        interval.tick().await; // consume the immediate first tick so the first advance() is a full period in
+        let mut tick: u64 = 0;
+        let mut blocks: u32 = 0;
         loop {
             interval.tick().await;
+            tick += 1;
             let mut n = state.node.lock().unwrap();
             n.advance();
+            if tpb != 0 && tick.is_multiple_of(tpb) {
+                n.mine_block();
+                blocks += 1;
+                if reload_every != 0 && blocks.is_multiple_of(reload_every) {
+                    // Node-restart disruption: drop most of the mempool and
+                    // report loaded:false for the next poll.
+                    n.mass_drop(0.8);
+                    n.reload();
+                }
+            }
         }
     });
 
     Ok(addr)
+}
+
+/// How many `churn_secs`-length churn ticks elapse between simulated blocks.
+/// `block_secs == 0` disables mining (returns 0). Otherwise the result is
+/// floored at 1 so a sub-tick block interval mines every tick rather than never.
+fn ticks_per_block(block_secs: u64, churn_secs: u64) -> u64 {
+    if block_secs == 0 {
+        0
+    } else {
+        (block_secs / churn_secs.max(1)).max(1)
+    }
 }
 
 async fn handle_rpc(
@@ -220,6 +247,14 @@ struct SimServeArgs {
     /// remote = getblock_remote profile; anything else = local_node.
     #[arg(long, default_value = "remote")]
     profile: String,
+    /// Seconds between simulated blocks (confirm top-fee txs, advance tip).
+    /// 0 = never mine (mempool churns only).
+    #[arg(long, default_value_t = 30)]
+    block_secs: u64,
+    /// Simulate a node restart (mass-drop + loaded:false) every N blocks.
+    /// 0 = never.
+    #[arg(long, default_value_t = 0)]
+    reload_every: u32,
 }
 
 /// Entry point for `main.rs`'s `sim-serve` guard: parses the sim flags,
@@ -246,9 +281,25 @@ pub async fn run_cli() -> anyhow::Result<()> {
         NetworkProfile::local_node()
     };
 
-    let addr = spawn(node, profile, args.port, 0, 0).await?;
+    let addr = spawn(node, profile, args.port, args.block_secs, args.reload_every).await?;
     tracing::info!(%addr, "sim node serving; point BTC_RPC_URL at it");
     std::future::pending::<anyhow::Result<()>>().await
+}
+
+#[cfg(test)]
+mod cadence_tests {
+    use super::ticks_per_block;
+
+    #[test]
+    fn ticks_per_block_maps_interval_to_churn_ticks() {
+        // 0 disables mining entirely.
+        assert_eq!(ticks_per_block(0, 2), 0);
+        // 30s blocks over 2s churn ticks => mine every 15 ticks.
+        assert_eq!(ticks_per_block(30, 2), 15);
+        // Sub-tick intervals floor at 1 (mine every tick) rather than never.
+        assert_eq!(ticks_per_block(1, 2), 1);
+        assert_eq!(ticks_per_block(2, 2), 1);
+    }
 }
 
 #[cfg(test)]
