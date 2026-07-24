@@ -38,6 +38,9 @@ pub struct GbtTx {
 #[derive(Debug, Clone)]
 pub struct Projection {
     /// One inner Vec per projected block, each a list of uids. Block 0 = next block.
+    #[allow(dead_code)]
+    /// Retained for tests and a possible future projected-blocks consumer; fee-tier
+    /// extraction reads from `effective_rates` instead.
     pub blocks: Vec<Vec<u32>>,
     /// CPFP-adjusted effective fee rate (sat/vB) for every included uid.
     pub effective_rates: HashMap<u32, f64>,
