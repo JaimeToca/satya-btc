@@ -83,6 +83,7 @@ pub async fn spawn(
     // watching the live server sees arrivals/evictions over time.
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(2));
+        interval.tick().await; // consume the immediate first tick; first advance() is one period in
         loop {
             interval.tick().await;
             let mut n = state.node.lock().unwrap();

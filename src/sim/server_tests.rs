@@ -50,16 +50,14 @@ mod tests {
 
     #[tokio::test]
     async fn real_client_sees_loaded_false_after_reload() {
-        use crate::rpc::MempoolRpc;
         let mut n = node(50);
         n.reload(); // node now reports loaded:false until its next advance()
         let addr = server::spawn(n, NetworkProfile::local_node(), 0, 0, 0)
             .await
             .unwrap();
         let rpc = client(addr);
-        // Immediately make the request to catch the node in reload state,
-        // before the churn timer's first tick completes. The timer waits
-        // 2 seconds between ticks after the first one.
+        // The churn timer's first advance() is now one full period (2s) out, so
+        // a millisecond-scale localhost roundtrip reliably observes the reload.
         let info = rpc.mempool_info().await.unwrap();
         assert_eq!(info.loaded, Some(false), "reload must surface loaded:false over HTTP");
     }
