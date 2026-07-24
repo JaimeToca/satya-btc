@@ -1,4 +1,5 @@
 mod config;
+mod gbt;
 mod http;
 mod mempool;
 mod rpc;
