@@ -15,8 +15,9 @@ pub const MAX_BLOCK_WEIGHT: u32 = 4_000_000;
 /// Weight held back for the coinbase / block overhead, so a projected block
 /// never packs the full 4M and overstates how much fee-paying data fits.
 pub const BLOCK_RESERVED_WEIGHT: u32 = 4_000;
-/// Number of projected blocks to build. The last is unbounded (the
-/// "everything else" block), so tiers past the horizon still have a floor.
+/// Number of projected blocks to build: `MAX_BLOCKS - 1` bounded (weight-limited)
+/// blocks, plus a final unbounded "everything else" block, so tiers past the
+/// horizon still have a floor.
 pub const MAX_BLOCKS: usize = 8;
 /// Consecutive non-fitting packages before we declare a bounded block full and
 /// move on. Mirrors Core's "try smaller options for a while" behaviour.
@@ -208,9 +209,16 @@ fn project_with(
         let pkg_weight: u32 = pkg.iter().map(|&m| audits[m as usize].weight).sum();
         let pkg_fee: u64 = pkg.iter().map(|&m| audits[m as usize].fee).sum();
 
-        let bounded = blocks.len() < max_blocks - 1;
-        if bounded && block_weight.saturating_add(pkg_weight) > max_block_weight {
-            // Doesn't fit this block; hold it and try smaller packages.
+        let bounded = blocks.len() < max_blocks.saturating_sub(1);
+        if bounded
+            && !cur_block.is_empty()
+            && block_weight.saturating_add(pkg_weight) > max_block_weight
+        {
+            // Doesn't fit the current partial block; hold it and try smaller
+            // packages that might. If `cur_block` were empty here, this package
+            // is oversized even for a fresh block, so fall through and force it
+            // in below rather than losing it to an overflow queue that's never
+            // requeued once the heap drains.
             overflow.push(uid);
             failures += 1;
         } else {
@@ -227,7 +235,7 @@ fn project_with(
 
         // Finalize the current bounded block when it's effectively full or the
         // heap is drained; the final (unbounded) block is pushed after the loop.
-        let bounded = blocks.len() < max_blocks - 1;
+        let bounded = blocks.len() < max_blocks.saturating_sub(1);
         if bounded && (failures > FAILURE_LIMIT || heap.is_empty()) && !cur_block.is_empty() {
             blocks.push(std::mem::take(&mut cur_block));
             block_weight = reserved;
@@ -382,5 +390,23 @@ mod tests {
         let proj = project(vec![]);
         assert!(proj.blocks.is_empty());
         assert!(proj.effective_rates.is_empty());
+    }
+
+    #[test]
+    fn oversized_tx_lands_in_its_own_block() {
+        // A single tx whose weight exceeds the entire consensus block weight
+        // limit can never fit any bounded block's budget. It must still be
+        // forced into a block of its own rather than silently vanishing.
+        let txs = vec![tx(0, 1_000, MAX_BLOCK_WEIGHT + 1_000, &[])];
+        let proj = project(txs);
+        assert!(!proj.blocks.is_empty(), "oversized tx must land in a block");
+        assert!(
+            proj.blocks.iter().any(|b| b.contains(&0)),
+            "uid 0 must appear in some projected block"
+        );
+        assert!(
+            proj.effective_rates.contains_key(&0),
+            "uid 0 must have an effective rate"
+        );
     }
 }
