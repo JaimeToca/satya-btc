@@ -335,9 +335,10 @@ template*.)
 *What fee rate confirms in ~N blocks?* Answer it the way the network actually
 answers it: **simulate what a rational miner would select.** A miner building the
 next candidate block picks the transactions that maximize the fees it collects,
-under a hard size constraint — so if we assemble the same block from the live
-mempool, its lowest-fee-rate transaction tells us the price of getting into the
-next block.
+under a hard size constraint — so if we assemble the same blocks from the live
+mempool, the resulting selection tells us the price of getting into the next
+block (and the ones after it; see [below](#from-projected-blocks-to-fee-tiers)
+for how that price is actually read off the simulation).
 
 #### The constraint
 
@@ -389,31 +390,48 @@ leftover mempool to fill the *next* projected block, and the next, and so on.
 ```
   weight
   limit ┤ ██████ block 1  (highest package feerates)      ─► "next block" tier
-        │ ▒▒▒▒▒▒ block 2                                        boundary feerate
+        │ ▒▒▒▒▒▒ block 2
         │ ▓▓▓▓▓▓ block 3  ─► "~30 min" tier
         │ ░░░░░░ ...
         │ ······ block 6  ─► "~1 hour" tier
         └────────────────────────────► descending package feerate
 
-  Each projected block is filled by descending package feerate; the feerate at a
-  block's lower boundary is the price of landing in (or before) that block.
+  Each projected block is filled by descending package feerate. The fee tiers are
+  not read off any single block's edge, but off a cumulative-weight histogram of
+  these effective rates (see below).
 ```
 
-Each projected block therefore has a **boundary fee rate** at its bottom edge:
-the cheapest package that still made it into that block.
+Packing this way also assigns every transaction a **CPFP-effective fee rate** — a
+package member inherits its package's combined rate. Those per-transaction
+effective rates, not any single block's bottom edge, are what the fee tiers are
+read from (next section).
 
 #### From projected blocks to fee tiers
 
-The tiers are read off the projected-block boundaries, with light smoothing and a
-**1 sat/vB floor**. The time labels assume the ~10-minute average block interval;
-they are expectations, not guarantees (a real block can take much longer):
+A tier answers "what fee confirms within ~N blocks?" You might read it off the
+Nth projected block's cheapest transaction — but that isn't reliable: greedy
+assembly fills the tail of each block with small, low-fee **gap-filler** txs that
+happen to fit the leftover weight, so an early block's *minimum* rate can dip
+below a later block's. Reading a single block's bottom edge would make "next
+block" report one of those gap-filler outliers — a too-low number, exactly the
+failure this project exists to avoid.
 
-| Tier            | Source                                                      |
-|-----------------|------------------------------------------------------------|
-| next block / fastest | boundary fee rate of **block 1**                      |
-| ~30 min         | boundary of **~block 3**                                    |
-| ~1 hour         | boundary of **~block 6**                                    |
-| economy         | the boundary of the **last projected block** — the cheapest package still expected to confirm in the current backlog |
+Instead the tiers are read off a **weight histogram of effective fee rates**: take
+every transaction's CPFP-effective rate paired with its weight, sort by rate
+(highest first), and walk down accumulating weight. The fee to confirm within N
+blocks is the rate at which cumulative weight first reaches **N × 4,000,000 WU**
+(N blocks' worth). This is **monotone by construction** — deeper tiers can only be
+cheaper — and immune to gap-filler outliers. If the mempool holds less than N
+blocks of weight, anything at the relay floor confirms, so that tier is the floor.
+The time labels assume the ~10-minute average block interval; they are
+expectations, not guarantees (a real block can take much longer):
+
+| Tier            | Source                                                              |
+|-----------------|----------------------------------------------------------------------|
+| next block / fastest | rate at **1 block** of cumulative weight                      |
+| ~30 min         | rate at **3 blocks** of cumulative weight                          |
+| ~1 hour         | rate at **6 blocks** of cumulative weight                         |
+| economy         | rate at the **projection horizon** (`MAX_BLOCKS` blocks) — the cheapest still expected to confirm in the current backlog |
 | minimum         | the mempool **min relay fee** (`mempoolminfee`) — the floor below which the node won't even accept the tx |
 
 #### Why the sync layer feeds this cleanly
@@ -426,11 +444,14 @@ The mempool builder was designed with this algorithm in mind:
   needs. (One caveat: those totals are a *snapshot* taken at fetch time and can
   drift as related txs come and go, so the estimator **recomputes** package
   feerates from the live cache rather than trusting the cached snapshot as final.)
-- **It runs incrementally.** Rather than rebuild every block template from
-  scratch, the estimator re-derives it against each mempool delta. Fed by the
-  fresh sync loop and ZMQ block-push, the fee number tracks reality with minimal
-  latency — which is the entire reason the sync layer works as hard as it does on
-  freshness.
+- **It recomputes from a fresh snapshot.** Rather than maintain a second,
+  long-lived copy of the mempool, the estimator rebuilds its working set from the
+  live cache on each run and re-derives the projection from scratch — so there is
+  no separate structure to keep in sync and no stale package data to carry
+  forward. The recompute runs off the async path (on a blocking thread) and is
+  throttled (`FEE_RECOMPUTE_MIN_INTERVAL_MS`, default 5s), so a fast-churning
+  mempool can't spin it. Fed by the fresh sync loop and ZMQ block-push, the fee
+  number still tracks reality with minimal latency.
 
 The `/fees` endpoint that exposes these tiers is gated on `caught_up`, so it never
 serves a number computed from a mempool it can't vouch for.
@@ -671,6 +692,21 @@ curl -s http://127.0.0.1:8080/health | jq
 | `network`                | string         | Network inferred from the node (`bitcoin`, `testnet`, `signet`, `regtest`) — no network flag to misconfigure. |
 | `last_sync_ok`           | number \| null | Unix seconds of the last successful sync, or `null` if never synced.    |
 | `age_secs`               | number \| null | Seconds since `last_sync_ok`; `null` if never synced. A freshness signal for consumers. |
+
+### `/fees` fields
+
+`GET /fees` returns the cached fee estimate, in **sat/vB**. It is gated on
+`caught_up`: before the first successful sync, or whenever `/health` reports the
+mempool is out of sync, it returns `503` rather than a number it can't vouch for.
+
+| Field           | Meaning                                                       |
+|-----------------|-----------------------------------------------------------------|
+| `next_block`   | rate to confirm within ~1 block (~next block)                 |
+| `within_3_blocks` | rate to confirm within ~3 blocks (~30 min)                    |
+| `within_6_blocks`      | rate to confirm within ~6 blocks (~1 hour)                    |
+| `horizon`   | rate at the projection horizon, floored at the minimum        |
+| `relay_floor`   | mempool min relay fee (`mempoolminfee`)                       |
+| `computed_at`         | unix seconds when the estimate was computed                   |
 
 ### Logging
 

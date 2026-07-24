@@ -11,7 +11,10 @@ fn churn(arrivals: usize, evictions: usize) -> ChurnConfig {
     ChurnConfig {
         arrivals_per_tick: arrivals,
         evictions_per_tick: evictions,
-        fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 500 },
+        fee: FeeDistribution {
+            min_sat_vb: 1,
+            max_sat_vb: 500,
+        },
     }
 }
 
@@ -20,6 +23,7 @@ fn cfg() -> SyncConfig {
         poll_interval: Duration::from_millis(10),
         fetch_concurrency: 5,
         tick_budget: Duration::from_secs(30), // generous: budget bail isn't under test here
+        fee_recompute_min_interval: Duration::from_millis(2000),
     }
 }
 
@@ -37,7 +41,13 @@ async fn cold_bulk_load_builds_full_mempool() {
     let state = empty_state();
     let mut caught_up_prev = false;
 
-    initial_bulk_load(&mut rpc, &state, Duration::from_millis(10), &mut caught_up_prev).await;
+    initial_bulk_load(
+        &mut rpc,
+        &state,
+        Duration::from_millis(10),
+        &mut caught_up_prev,
+    )
+    .await;
 
     let g = read_state(&state);
     assert_eq!(g.txs.len(), 5_000);
@@ -53,13 +63,30 @@ async fn steady_churn_local_stays_caught_up() {
     let mut caught_up_prev = false;
     let mut last_bulk = std::time::Instant::now();
 
-    initial_bulk_load(&mut rpc, &state, Duration::from_millis(10), &mut caught_up_prev).await;
+    initial_bulk_load(
+        &mut rpc,
+        &state,
+        Duration::from_millis(10),
+        &mut caught_up_prev,
+    )
+    .await;
 
     // Advance the node and run several steady ticks; a fast local profile keeps up.
     for _ in 0..5 {
         rpc.inner_mut().advance();
-        steady_tick(&mut rpc, &state, &cfg(), &mut caught_up_prev, &mut last_bulk).await;
-        assert!(read_state(&state).caught_up, "local profile must stay caught up");
+        steady_tick(
+            &mut rpc,
+            &state,
+            &cfg(),
+            &mut caught_up_prev,
+            &mut last_bulk,
+            &mut std::time::Instant::now(),
+        )
+        .await;
+        assert!(
+            read_state(&state).caught_up,
+            "local profile must stay caught up"
+        );
         assert_eq!(
             read_state(&state).txs.len(),
             rpc.inner_mut().len(),
@@ -92,11 +119,28 @@ async fn rate_limited_remote_falls_behind() {
     let mut caught_up_prev = false;
     let mut last_bulk = std::time::Instant::now();
 
-    initial_bulk_load(&mut rpc, &state, Duration::from_millis(10), &mut caught_up_prev).await;
-    assert!(read_state(&state).caught_up, "bulk verbose load succeeds even remote");
+    initial_bulk_load(
+        &mut rpc,
+        &state,
+        Duration::from_millis(10),
+        &mut caught_up_prev,
+    )
+    .await;
+    assert!(
+        read_state(&state).caught_up,
+        "bulk verbose load succeeds even remote"
+    );
 
     rpc.inner_mut().advance();
-    steady_tick(&mut rpc, &state, &cfg(), &mut caught_up_prev, &mut last_bulk).await;
+    steady_tick(
+        &mut rpc,
+        &state,
+        &cfg(),
+        &mut caught_up_prev,
+        &mut last_bulk,
+        &mut std::time::Instant::now(),
+    )
+    .await;
     assert!(
         !read_state(&state).caught_up,
         "throttled per-tx catch-up must report backlog (caught_up=false)"
@@ -137,8 +181,18 @@ async fn mass_drop_via_bulk_load_shrinks_cache() {
     let state = empty_state();
     let mut caught_up_prev = false;
 
-    initial_bulk_load(&mut rpc, &state, Duration::from_millis(10), &mut caught_up_prev).await;
-    assert_eq!(read_state(&state).txs.len(), 1_000, "cache matches post-drop node");
+    initial_bulk_load(
+        &mut rpc,
+        &state,
+        Duration::from_millis(10),
+        &mut caught_up_prev,
+    )
+    .await;
+    assert_eq!(
+        read_state(&state).txs.len(),
+        1_000,
+        "cache matches post-drop node"
+    );
 }
 
 #[tokio::test]
@@ -153,7 +207,13 @@ async fn steady_tick_detects_mass_drop_and_defers_under_cooldown() {
     let state = empty_state();
     let mut caught_up_prev = false;
 
-    initial_bulk_load(&mut rpc, &state, Duration::from_millis(10), &mut caught_up_prev).await;
+    initial_bulk_load(
+        &mut rpc,
+        &state,
+        Duration::from_millis(10),
+        &mut caught_up_prev,
+    )
+    .await;
     assert_eq!(read_state(&state).txs.len(), 5_000);
     assert!(read_state(&state).caught_up);
 
@@ -166,7 +226,15 @@ async fn steady_tick_detects_mass_drop_and_defers_under_cooldown() {
     // Cooldown ACTIVE: last_bulk_resync is "now", well within RESYNC_COOLDOWN
     // (60s), so `decide_desync` must route to `WaitCooldown`, NOT `BulkResync`.
     let mut last_bulk_resync = std::time::Instant::now();
-    steady_tick(&mut rpc, &state, &cfg(), &mut caught_up_prev, &mut last_bulk_resync).await;
+    steady_tick(
+        &mut rpc,
+        &state,
+        &cfg(),
+        &mut caught_up_prev,
+        &mut last_bulk_resync,
+        &mut std::time::Instant::now(),
+    )
+    .await;
 
     // The distinguishing assertion: the NORMAL per-tx diff path would have
     // removed the ~4500 departed txids and shrunk the cache to ~500. The cache
@@ -186,6 +254,53 @@ async fn steady_tick_detects_mass_drop_and_defers_under_cooldown() {
 }
 
 #[tokio::test]
+async fn fee_estimate_is_populated_and_monotone() {
+    let node = MockNode::new(99, 5_000, churn(50, 40));
+    let mut rpc = SimulatedRpc::new(node, NetworkProfile::local_node());
+    let state = empty_state();
+    let mut caught_up_prev = false;
+    let mut last_bulk = std::time::Instant::now();
+    // Backdate the fee-recompute timer so the throttle (2s in `cfg()`) lets the
+    // recompute run on this tick instead of skipping it.
+    let mut last_fee = std::time::Instant::now() - Duration::from_secs(10);
+
+    initial_bulk_load(
+        &mut rpc,
+        &state,
+        Duration::from_millis(10),
+        &mut caught_up_prev,
+    )
+    .await;
+    rpc.inner_mut().advance();
+    steady_tick(
+        &mut rpc,
+        &state,
+        &cfg(),
+        &mut caught_up_prev,
+        &mut last_bulk,
+        &mut last_fee,
+    )
+    .await;
+
+    let g = read_state(&state);
+    assert!(
+        g.caught_up,
+        "local profile should be caught up after a healthy tick"
+    );
+    let est = g
+        .fee_estimate
+        .clone()
+        .expect("fee estimate should be populated after a healthy tick with the recompute due");
+    // Tiers finite, floored at the relay minimum, and monotone non-increasing.
+    assert!(est.next_block.is_finite());
+    assert!(est.next_block >= est.relay_floor - 1e-9);
+    assert!(est.next_block >= est.within_3_blocks - 1e-9);
+    assert!(est.within_3_blocks >= est.within_6_blocks - 1e-9);
+    assert!(est.within_6_blocks >= est.horizon - 1e-9);
+    assert!(est.horizon >= est.relay_floor - 1e-9);
+}
+
+#[tokio::test]
 async fn steady_tick_mass_drop_resyncs_when_cooldown_expired() {
     // Companion to `steady_tick_detects_mass_drop_and_defers_under_cooldown`:
     // once the cooldown has expired, the SAME mass-drop condition must route to
@@ -196,7 +311,13 @@ async fn steady_tick_mass_drop_resyncs_when_cooldown_expired() {
     let state = empty_state();
     let mut caught_up_prev = false;
 
-    initial_bulk_load(&mut rpc, &state, Duration::from_millis(10), &mut caught_up_prev).await;
+    initial_bulk_load(
+        &mut rpc,
+        &state,
+        Duration::from_millis(10),
+        &mut caught_up_prev,
+    )
+    .await;
     assert_eq!(read_state(&state).txs.len(), 5_000);
 
     rpc.inner_mut().mass_drop(0.9);
@@ -205,7 +326,15 @@ async fn steady_tick_mass_drop_resyncs_when_cooldown_expired() {
     // Cooldown EXPIRED: last_bulk_resync is 61s in the past, past RESYNC_COOLDOWN
     // (60s), so `decide_desync` must route to `BulkResync` and reload now.
     let mut last_bulk_resync = std::time::Instant::now() - Duration::from_secs(61);
-    steady_tick(&mut rpc, &state, &cfg(), &mut caught_up_prev, &mut last_bulk_resync).await;
+    steady_tick(
+        &mut rpc,
+        &state,
+        &cfg(),
+        &mut caught_up_prev,
+        &mut last_bulk_resync,
+        &mut std::time::Instant::now(),
+    )
+    .await;
 
     assert_eq!(
         read_state(&state).txs.len(),

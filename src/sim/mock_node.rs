@@ -148,6 +148,9 @@ impl MockNode {
             fees,
             ancestorsize: vsize,
             descendantsize: vsize,
+            // Fixed synthetic entry time; the sim doesn't model tx age, so a
+            // constant keeps snapshots deterministic.
+            time: Some(1_700_000_000),
         };
         (txid, entry)
     }
@@ -196,6 +199,7 @@ fn clone_entry(e: &MempoolEntry) -> MempoolEntry {
         },
         ancestorsize: e.ancestorsize,
         descendantsize: e.descendantsize,
+        time: e.time,
     }
 }
 

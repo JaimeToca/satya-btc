@@ -4,11 +4,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::SystemTime;
 
-// The cache stores full per-tx package data, but no consumer reads these fields
-// yet — the GBT fee estimator (`/fees`) that will read them is not built. The
-// fields are populated and carried deliberately as its data substrate (and are
-// exercised by the simulation harness), so silence the write-only `dead_code`
-// lint here rather than dropping data we're about to need.
+// The cache stores full per-tx package data, but no consumer reads these fields.
+// The GBT fee estimator (`/fees`) is now built, but it recomputes package
+// (ancestor/descendant) feerates itself from the live `depends` graph (see
+// `gbt`) rather than trust these cached snapshot fields, so they stay
+// carried-but-unread for now. The fields are populated deliberately as
+// substrate for that (and are exercised by the simulation harness), so silence
+// the write-only `dead_code` lint here rather than dropping data we still need.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MempoolTx {
@@ -28,6 +30,13 @@ pub struct MempoolTx {
     pub ancestor_vsize: u32,
     pub descendant_fee: Amount,
     pub descendant_vsize: u32,
+    /// Unix time (seconds) the tx entered the NODE's mempool, straight from
+    /// `MempoolEntry::time`. Node clock domain (compute age as `now_unix -
+    /// first_seen`), NOT our `SystemTime` — a faithful passthrough that's stable
+    /// across our restarts and reconstructed identically by a bulk resync, so
+    /// there's no cross-tick timestamp to preserve. `0` means the node didn't
+    /// report a time (unknown; filterable, never understates age).
+    pub first_seen: u64,
 }
 
 impl From<&MempoolEntry> for MempoolTx {
@@ -51,6 +60,10 @@ impl From<&MempoolEntry> for MempoolTx {
             ancestor_vsize: u32::try_from(entry.ancestorsize).unwrap_or(u32::MAX),
             descendant_fee: entry.fees.descendant,
             descendant_vsize: u32::try_from(entry.descendantsize).unwrap_or(u32::MAX),
+            // `0` sentinel when the node omits `time` (older/alt stacks): an
+            // absurd age (now - 0) that's trivially filterable rather than a
+            // fake-recent stamp that would understate the tx's real age.
+            first_seen: entry.time.unwrap_or(0),
         }
     }
 }
@@ -72,6 +85,8 @@ pub struct MempoolState {
     pub network: Network,
     pub caught_up: bool,
     pub last_sync_ok: Option<SystemTime>,
+    /// Most recent computed fee estimate, or `None` before the first recompute.
+    pub fee_estimate: Option<crate::fees::FeeEstimate>,
 }
 
 impl MempoolState {
@@ -83,6 +98,7 @@ impl MempoolState {
             network,
             caught_up: false,
             last_sync_ok: None,
+            fee_estimate: None,
         }
     }
 }
@@ -110,4 +126,50 @@ pub fn compute_diff(cache_keys: &HashSet<Txid>, node_txids: &HashSet<Txid>) -> D
     let new = node_txids.difference(cache_keys).copied().collect();
     let gone = cache_keys.difference(node_txids).copied().collect();
     Diff { new, gone }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rpc::MempoolEntryFees;
+
+    /// Minimal `MempoolEntry` with a caller-chosen `time`; other fields are
+    /// irrelevant to the `first_seen` mapping under test.
+    fn entry_with_time(time: Option<u64>) -> MempoolEntry {
+        let zero = Amount::from_sat(0);
+        MempoolEntry {
+            vsize: 140,
+            weight: Some(560),
+            depends: Vec::new(),
+            fees: MempoolEntryFees {
+                base: zero,
+                ancestor: zero,
+                descendant: zero,
+            },
+            ancestorsize: 140,
+            descendantsize: 140,
+            time,
+        }
+    }
+
+    #[test]
+    fn first_seen_carries_node_entry_time() {
+        // The node's `time` passes straight through to `first_seen`, unchanged.
+        let tx = MempoolTx::from(&entry_with_time(Some(1_700_000_042)));
+        assert_eq!(tx.first_seen, 1_700_000_042);
+    }
+
+    #[test]
+    fn first_seen_falls_back_to_zero_when_time_absent() {
+        // Older/alt nodes may omit `time`; we record `0` ("unknown") rather than
+        // a fake-recent stamp that would understate the tx's real age.
+        let tx = MempoolTx::from(&entry_with_time(None));
+        assert_eq!(tx.first_seen, 0);
+    }
+
+    #[test]
+    fn new_state_has_no_fee_estimate() {
+        let s = MempoolState::new(Network::Bitcoin);
+        assert!(s.fee_estimate.is_none());
+    }
 }
