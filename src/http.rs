@@ -1,5 +1,5 @@
 use crate::mempool::{read_state, SharedState};
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
@@ -20,6 +20,7 @@ struct Health {
 pub fn router(state: SharedState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/fees", get(fees))
         // Access log: one INFO line per request with method, path, status, and
         // latency. Emitted through the same tracing subscriber as everything
         // else, so it obeys RUST_LOG. To quiet the frequent /health poll in
@@ -55,4 +56,15 @@ async fn health(State(state): State<SharedState>) -> Json<Health> {
         last_sync_ok,
         age_secs,
     })
+}
+
+/// Serve the cached fee estimate — but only when the sync layer vouches for the
+/// mempool (`caught_up`). Returns `503` before the first estimate or whenever the
+/// view is known to be behind, so we never serve a number we can't stand behind.
+async fn fees(State(state): State<SharedState>) -> impl IntoResponse {
+    let s = read_state(&state);
+    match &s.fee_estimate {
+        Some(est) if s.caught_up => Json(est.clone()).into_response(),
+        _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
