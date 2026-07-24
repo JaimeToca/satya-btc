@@ -18,6 +18,7 @@ binary. No database, no Redis, no explorer.
   - [Estimating fees by simulating the next blocks](#estimating-fees-by-simulating-the-next-blocks)
   - [What bounds the accuracy of the estimate](#what-bounds-the-accuracy-of-the-estimate)
 - [Deployment](#deployment)
+  - [Testing without a Bitcoin node](#testing-without-a-bitcoin-node)
 - [Engineering notes](#engineering-notes)
 - [License](#license)
 
