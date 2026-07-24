@@ -613,6 +613,41 @@ thin signet mempool rarely has enough backlog to fill multiple projected blocks,
 the fee *tiers* it produces are uninteresting by design — signet fee levels aren't
 mainnet levels. Treat it as a functional check, not a production estimate.
 
+### Testing without a Bitcoin node
+
+You can exercise the entire indexer — the real `reqwest` client, sync loop, fee
+engine, and HTTP API — against an offline fake node, with no Bitcoin Core. The
+sim node churns a mempool, mines blocks (confirming top-fee txs and advancing
+the tip), and can simulate a node restart. Everything is behind the `simulation`
+feature, so the release binary ships none of it.
+
+Three terminals:
+
+    just simulate          # fake node on :18443 — blocks every 30s + mempool churn
+    just sim-run           # the REAL indexer, pointed at :18443, API on :8080
+    just watch             # live /health + /fees every 2s
+
+Tuning the fake node (restart `sim-serve` to change):
+
+    cargo run --features simulation -- sim-serve \
+        --profile remote \       # throttled provider (rate-limited, ~150ms) vs `local`
+        --size 20000 \           # initial mempool size
+        --arrivals 600 --evictions 600 \   # churn per 2s tick
+        --block-secs 30 \        # seconds between blocks (0 = never mine)
+        --reload-every 5         # simulate a node restart every 5 blocks (0 = off)
+
+What to look for while `just watch` runs:
+
+- `--profile remote` → `caught_up` flips to `false` (reproduces the throttled-
+  provider backlog); `--profile local` stays caught up.
+- `/fees` populates within a few ticks; tiers are monotone (higher confirmation
+  target ⇒ lower fee) and dip on each mined block, then recover as churn refills.
+- `--reload-every N` → the mempool collapses and `caught_up` briefly drops, then
+  the sync loop resyncs and settles (mass-drop + cooldown path).
+
+For a real node instead, uncomment an auth block in `.env` and point
+`BTC_RPC_URL` at your Bitcoin Core RPC (see `just regtest-up`).
+
 ### Run it
 
 **Binary:**
