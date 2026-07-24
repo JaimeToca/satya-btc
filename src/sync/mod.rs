@@ -100,6 +100,37 @@ fn apply_bulk_success(state: &SharedState, caught_up_prev: &mut bool, count: usi
     g.last_sync_ok = Some(SystemTime::now());
 }
 
+/// Recompute the fee estimate if at least `min_interval` has passed since the
+/// last recompute. Snapshots the tx fields the projector needs under a read
+/// lock, runs the CPU-bound projection on the blocking pool, then stores the
+/// result. `last` is advanced only when a recompute actually runs.
+async fn maybe_recompute_fees(state: &SharedState, last: &mut Instant, min_interval: Duration) {
+    if last.elapsed() < min_interval {
+        return;
+    }
+    let (snapshot, min_fee) = {
+        let g = read_state(state);
+        let snapshot: Vec<(Txid, u64, u32, Vec<Txid>)> = g
+            .txs
+            .iter()
+            .map(|(id, tx)| (*id, tx.fee.to_sat(), tx.weight, tx.depends.clone()))
+            .collect();
+        (snapshot, g.mempool_min_fee_sat_vb)
+    };
+    match tokio::task::spawn_blocking(move || crate::fees::compute_estimate(&snapshot, min_fee))
+        .await
+    {
+        Ok(estimate) => {
+            let mut g = write_state(state);
+            g.fee_estimate = Some(estimate);
+        }
+        Err(e) => {
+            tracing::warn!(error = %short_err(&e), "fee recompute task failed");
+        }
+    }
+    *last = Instant::now();
+}
+
 /// Maximum number of newly-seen txids we'll fetch full details for in a
 /// single tick. Bounds per-tick RPC volume so an unbounded (or malicious)
 /// mempool can't force one tick to issue hundreds of thousands of sequential
@@ -157,6 +188,11 @@ pub async fn run<R: MempoolRpc + Clone + Send + Sync + 'static>(
     let mut last_bulk_resync =
         initial_bulk_load(&mut rpc, &state, poll_interval, &mut caught_up_prev).await;
 
+    // Force a fee recompute on the first steady tick by backdating the timer.
+    let mut last_fee_recompute = Instant::now()
+        .checked_sub(cfg.fee_recompute_min_interval)
+        .unwrap_or_else(Instant::now);
+
     // --- Steady-state loop. ---
     // Per-tick fetch concurrency is bounded by `buffer_unordered` in
     // `fetch_new_entries`. Because the RPC is now async over reqwest, dropping
@@ -177,6 +213,7 @@ pub async fn run<R: MempoolRpc + Clone + Send + Sync + 'static>(
             &cfg,
             &mut caught_up_prev,
             &mut last_bulk_resync,
+            &mut last_fee_recompute,
         )
         .await;
     }
@@ -230,14 +267,16 @@ async fn initial_bulk_load<R: MempoolRpc + Clone + Send + Sync + 'static>(
 }
 
 /// One steady-state tick: read node state, react to desync, else diff/fetch and
-/// update the cache. `caught_up_prev` and `last_bulk_resync` are threaded by
-/// `&mut` and mutated in place across ticks.
+/// update the cache. `caught_up_prev`, `last_bulk_resync`, and
+/// `last_fee_recompute` are threaded by `&mut` and mutated in place across
+/// ticks.
 async fn steady_tick<R: MempoolRpc + Clone + Send + Sync + 'static>(
     rpc: &mut R,
     state: &SharedState,
     cfg: &SyncConfig,
     caught_up_prev: &mut bool,
     last_bulk_resync: &mut Instant,
+    last_fee_recompute: &mut Instant,
 ) {
     let info = match rpc.mempool_info().await {
         Ok(info) => info,
@@ -303,7 +342,15 @@ async fn steady_tick<R: MempoolRpc + Clone + Send + Sync + 'static>(
                 // can't force a full download every tick.
                 *last_bulk_resync = Instant::now();
                 match bulk_resync(rpc, state).await {
-                    Some(count) => apply_bulk_success(state, caught_up_prev, count),
+                    Some(count) => {
+                        apply_bulk_success(state, caught_up_prev, count);
+                        maybe_recompute_fees(
+                            state,
+                            last_fee_recompute,
+                            cfg.fee_recompute_min_interval,
+                        )
+                        .await;
+                    }
                     None => set_synced(state, caught_up_prev, false, "resync_failed", 0),
                 }
             }
@@ -380,6 +427,9 @@ async fn steady_tick<R: MempoolRpc + Clone + Send + Sync + 'static>(
             g.last_sync_ok = Some(SystemTime::now());
         }
     }
+
+    // Refresh the fee estimate from the just-applied mempool (throttled).
+    maybe_recompute_fees(state, last_fee_recompute, cfg.fee_recompute_min_interval).await;
 }
 
 /// Fetch full details for (a capped slice of) this tick's new txids, best-effort,

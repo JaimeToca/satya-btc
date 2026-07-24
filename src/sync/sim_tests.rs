@@ -59,7 +59,7 @@ async fn steady_churn_local_stays_caught_up() {
     // Advance the node and run several steady ticks; a fast local profile keeps up.
     for _ in 0..5 {
         rpc.inner_mut().advance();
-        steady_tick(&mut rpc, &state, &cfg(), &mut caught_up_prev, &mut last_bulk).await;
+        steady_tick(&mut rpc, &state, &cfg(), &mut caught_up_prev, &mut last_bulk, &mut std::time::Instant::now()).await;
         assert!(read_state(&state).caught_up, "local profile must stay caught up");
         assert_eq!(
             read_state(&state).txs.len(),
@@ -97,7 +97,7 @@ async fn rate_limited_remote_falls_behind() {
     assert!(read_state(&state).caught_up, "bulk verbose load succeeds even remote");
 
     rpc.inner_mut().advance();
-    steady_tick(&mut rpc, &state, &cfg(), &mut caught_up_prev, &mut last_bulk).await;
+    steady_tick(&mut rpc, &state, &cfg(), &mut caught_up_prev, &mut last_bulk, &mut std::time::Instant::now()).await;
     assert!(
         !read_state(&state).caught_up,
         "throttled per-tx catch-up must report backlog (caught_up=false)"
@@ -167,7 +167,7 @@ async fn steady_tick_detects_mass_drop_and_defers_under_cooldown() {
     // Cooldown ACTIVE: last_bulk_resync is "now", well within RESYNC_COOLDOWN
     // (60s), so `decide_desync` must route to `WaitCooldown`, NOT `BulkResync`.
     let mut last_bulk_resync = std::time::Instant::now();
-    steady_tick(&mut rpc, &state, &cfg(), &mut caught_up_prev, &mut last_bulk_resync).await;
+    steady_tick(&mut rpc, &state, &cfg(), &mut caught_up_prev, &mut last_bulk_resync, &mut std::time::Instant::now()).await;
 
     // The distinguishing assertion: the NORMAL per-tx diff path would have
     // removed the ~4500 departed txids and shrunk the cache to ~500. The cache
@@ -206,7 +206,7 @@ async fn steady_tick_mass_drop_resyncs_when_cooldown_expired() {
     // Cooldown EXPIRED: last_bulk_resync is 61s in the past, past RESYNC_COOLDOWN
     // (60s), so `decide_desync` must route to `BulkResync` and reload now.
     let mut last_bulk_resync = std::time::Instant::now() - Duration::from_secs(61);
-    steady_tick(&mut rpc, &state, &cfg(), &mut caught_up_prev, &mut last_bulk_resync).await;
+    steady_tick(&mut rpc, &state, &cfg(), &mut caught_up_prev, &mut last_bulk_resync, &mut std::time::Instant::now()).await;
 
     assert_eq!(
         read_state(&state).txs.len(),
