@@ -101,25 +101,32 @@ with the same rationale-comment style as `decision.rs`.
   Build a throwaway `HashMap<Txid, u32>` uid map for this run; map each tx's
   `depends` to parent uids (dropping any parent not in the set — same semantics as
   Core's in-mempool-only ancestors). `order` = first 4 bytes of the txid.
-- **Tier extraction:** `Projection` + `mempool_min_fee_sat_vb` → `FeeEstimate`.
+- **Tier extraction:** the projection's per-tx CPFP-effective rates + each tx's
+  weight + `mempool_min_fee_sat_vb` → `FeeEstimate`.
 - **Orchestration:** throttled recompute driver (below).
 
 ```rust
 #[derive(Debug, Clone, Serialize)]
 pub struct FeeEstimate {
-    pub fastest_fee: f64,    // block 0 boundary (~next block)
-    pub half_hour_fee: f64,  // ~block 2 boundary (~3 blocks)
-    pub hour_fee: f64,       // ~block 5 boundary (~6 blocks)
-    pub economy_fee: f64,    // last projected block's boundary, floored at minimum_fee
+    pub fastest_fee: f64,    // depth 1 block (~next block)
+    pub half_hour_fee: f64,  // depth 3 blocks (~30 min)
+    pub hour_fee: f64,       // depth 6 blocks (~1 hour)
+    pub economy_fee: f64,    // depth MAX_BLOCKS (projection horizon), floored at minimum_fee
     pub minimum_fee: f64,    // mempool_min_fee_sat_vb (relay floor)
     pub as_of: u64,          // unix seconds this estimate was computed
 }
 ```
 
-Tier rule: each "get into block N" number is the **lowest effective fee rate that
-still fit into that block** (the block's boundary rate). Block→minute mapping
-(0→next, 2→30m, 5→1h) is defined here as named constants. `economy_fee` = the
-boundary rate of the last projected block, floored at `minimum_fee`.
+Tier rule — **weight histogram of effective rates.** Reading a tier off a single
+projected block's *minimum* rate is NOT monotone: greedy assembly fills the tail
+of early blocks with small low-rate gap-filler txs, so block 0's minimum can dip
+below a later block's. Instead, tiers are read off a weight histogram: take
+`(effective_rate, weight)` for every tx, sort by rate descending, and the fee to
+confirm within N blocks is the rate at which cumulative weight first reaches
+`N × MAX_BLOCK_WEIGHT`. This is **monotone by construction**
+(`fastest ≥ half_hour ≥ hour ≥ economy`) and robust to gap-filler outliers. If the
+mempool holds less than N blocks of weight, anything at the relay floor confirms,
+so that tier is the floor. Depths (1 / 3 / 6 / `MAX_BLOCKS`) are named constants;
 `minimum_fee` = `mempool_min_fee_sat_vb`. All tunable without touching `gbt.rs`.
 
 ## Integration with the sync loop
