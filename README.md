@@ -701,12 +701,12 @@ mempool is out of sync, it returns `503` rather than a number it can't vouch for
 
 | Field           | Meaning                                                       |
 |-----------------|-----------------------------------------------------------------|
-| `fastest_fee`   | rate to confirm within ~1 block (~next block)                 |
-| `half_hour_fee` | rate to confirm within ~3 blocks (~30 min)                    |
-| `hour_fee`      | rate to confirm within ~6 blocks (~1 hour)                    |
-| `economy_fee`   | rate at the projection horizon, floored at the minimum        |
-| `minimum_fee`   | mempool min relay fee (`mempoolminfee`)                       |
-| `as_of`         | unix seconds when the estimate was computed                   |
+| `next_block`   | rate to confirm within ~1 block (~next block)                 |
+| `within_3_blocks` | rate to confirm within ~3 blocks (~30 min)                    |
+| `within_6_blocks`      | rate to confirm within ~6 blocks (~1 hour)                    |
+| `horizon`   | rate at the projection horizon, floored at the minimum        |
+| `relay_floor`   | mempool min relay fee (`mempoolminfee`)                       |
+| `computed_at`         | unix seconds when the estimate was computed                   |
 
 ### Logging
 

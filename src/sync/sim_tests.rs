@@ -292,12 +292,12 @@ async fn fee_estimate_is_populated_and_monotone() {
         .clone()
         .expect("fee estimate should be populated after a healthy tick with the recompute due");
     // Tiers finite, floored at the relay minimum, and monotone non-increasing.
-    assert!(est.fastest_fee.is_finite());
-    assert!(est.fastest_fee >= est.minimum_fee - 1e-9);
-    assert!(est.fastest_fee >= est.half_hour_fee - 1e-9);
-    assert!(est.half_hour_fee >= est.hour_fee - 1e-9);
-    assert!(est.hour_fee >= est.economy_fee - 1e-9);
-    assert!(est.economy_fee >= est.minimum_fee - 1e-9);
+    assert!(est.next_block.is_finite());
+    assert!(est.next_block >= est.relay_floor - 1e-9);
+    assert!(est.next_block >= est.within_3_blocks - 1e-9);
+    assert!(est.within_3_blocks >= est.within_6_blocks - 1e-9);
+    assert!(est.within_6_blocks >= est.horizon - 1e-9);
+    assert!(est.horizon >= est.relay_floor - 1e-9);
 }
 
 #[tokio::test]

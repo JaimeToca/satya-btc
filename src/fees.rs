@@ -15,12 +15,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Recommended fee tiers (sat/vB) plus the unix second they were computed.
 #[derive(Debug, Clone, Serialize)]
 pub struct FeeEstimate {
-    pub fastest_fee: f64,   // depth 1 block (~next block)
-    pub half_hour_fee: f64, // depth 3 blocks (~30 min)
-    pub hour_fee: f64,      // depth 6 blocks (~1 hour)
-    pub economy_fee: f64,   // depth MAX_BLOCKS (projection horizon), floored at minimum
-    pub minimum_fee: f64,   // relay floor (mempoolminfee)
-    pub as_of: u64,
+    pub next_block: f64,      // depth 1 (~next block)
+    pub within_3_blocks: f64, // depth 3 (~30 min)
+    pub within_6_blocks: f64, // depth 6 (~1 hour)
+    pub horizon: f64,         // deepest projected block, floored at relay_floor
+    pub relay_floor: f64,     // mempool min relay fee (mempoolminfee)
+    pub computed_at: u64,     // unix seconds the estimate was computed
 }
 
 fn now_unix() -> u64 {
@@ -66,17 +66,17 @@ fn tier_at_depth(sorted_desc: &[(f64, u32)], depth_blocks: u64, floor: f64) -> f
 pub fn recommended_tiers(
     mut rate_weights: Vec<(f64, u32)>,
     min_fee_sat_vb: f64,
-    as_of: u64,
+    computed_at: u64,
 ) -> FeeEstimate {
     let floor = min_fee_sat_vb;
     rate_weights.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     FeeEstimate {
-        fastest_fee: tier_at_depth(&rate_weights, FASTEST_DEPTH, floor),
-        half_hour_fee: tier_at_depth(&rate_weights, HALF_HOUR_DEPTH, floor),
-        hour_fee: tier_at_depth(&rate_weights, HOUR_DEPTH, floor),
-        economy_fee: tier_at_depth(&rate_weights, ECONOMY_DEPTH, floor),
-        minimum_fee: floor,
-        as_of,
+        next_block: tier_at_depth(&rate_weights, FASTEST_DEPTH, floor),
+        within_3_blocks: tier_at_depth(&rate_weights, HALF_HOUR_DEPTH, floor),
+        within_6_blocks: tier_at_depth(&rate_weights, HOUR_DEPTH, floor),
+        horizon: tier_at_depth(&rate_weights, ECONOMY_DEPTH, floor),
+        relay_floor: floor,
+        computed_at,
     }
 }
 
@@ -136,12 +136,12 @@ mod tests {
     #[test]
     fn empty_mempool_all_tiers_at_minimum() {
         let est = recommended_tiers(vec![], 3.0, 42);
-        assert_eq!(est.fastest_fee, 3.0);
-        assert_eq!(est.half_hour_fee, 3.0);
-        assert_eq!(est.hour_fee, 3.0);
-        assert_eq!(est.economy_fee, 3.0);
-        assert_eq!(est.minimum_fee, 3.0);
-        assert_eq!(est.as_of, 42);
+        assert_eq!(est.next_block, 3.0);
+        assert_eq!(est.within_3_blocks, 3.0);
+        assert_eq!(est.within_6_blocks, 3.0);
+        assert_eq!(est.horizon, 3.0);
+        assert_eq!(est.relay_floor, 3.0);
+        assert_eq!(est.computed_at, 42);
     }
 
     #[test]
@@ -151,21 +151,21 @@ mod tests {
         // deliberately unsorted on input.
         let rw = vec![(5.0, bw), (100.0, bw), (20.0, bw), (50.0, bw)];
         let est = recommended_tiers(rw, 1.0, 0);
-        assert_eq!(est.fastest_fee, 100.0); // depth 1 -> top block
-        assert_eq!(est.half_hour_fee, 20.0); // depth 3 -> 3rd-highest block
-        assert_eq!(est.hour_fee, 1.0); // depth 6 -> only 4 blocks exist -> floor
-        assert_eq!(est.economy_fee, 1.0); // depth 8 -> floor
-        assert!(est.fastest_fee >= est.half_hour_fee);
-        assert!(est.half_hour_fee >= est.hour_fee);
-        assert!(est.hour_fee >= est.economy_fee);
+        assert_eq!(est.next_block, 100.0); // depth 1 -> top block
+        assert_eq!(est.within_3_blocks, 20.0); // depth 3 -> 3rd-highest block
+        assert_eq!(est.within_6_blocks, 1.0); // depth 6 -> only 4 blocks exist -> floor
+        assert_eq!(est.horizon, 1.0); // depth 8 -> floor
+        assert!(est.next_block >= est.within_3_blocks);
+        assert!(est.within_3_blocks >= est.within_6_blocks);
+        assert!(est.within_6_blocks >= est.horizon);
     }
 
     #[test]
     fn tiers_floored_at_minimum() {
         let bw = crate::gbt::MAX_BLOCK_WEIGHT;
         let est = recommended_tiers(vec![(2.0, bw)], 5.0, 0);
-        assert_eq!(est.fastest_fee, 5.0); // 2 floored up to relay minimum 5
-        assert_eq!(est.minimum_fee, 5.0);
+        assert_eq!(est.next_block, 5.0); // 2 floored up to relay minimum 5
+        assert_eq!(est.relay_floor, 5.0);
     }
 
     #[test]
@@ -175,7 +175,7 @@ mod tests {
         // threshold is only reached at the 40 tx, so that's the marginal rate.
         let rw = vec![(100.0, bw / 2), (40.0, bw / 2)];
         let est = recommended_tiers(rw, 1.0, 0);
-        assert_eq!(est.fastest_fee, 40.0);
-        assert_eq!(est.half_hour_fee, 1.0); // only 1 block of weight -> deeper tiers floor
+        assert_eq!(est.next_block, 40.0);
+        assert_eq!(est.within_3_blocks, 1.0); // only 1 block of weight -> deeper tiers floor
     }
 }

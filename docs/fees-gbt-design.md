@@ -108,12 +108,12 @@ with the same rationale-comment style as `decision.rs`.
 ```rust
 #[derive(Debug, Clone, Serialize)]
 pub struct FeeEstimate {
-    pub fastest_fee: f64,    // depth 1 block (~next block)
-    pub half_hour_fee: f64,  // depth 3 blocks (~30 min)
-    pub hour_fee: f64,       // depth 6 blocks (~1 hour)
-    pub economy_fee: f64,    // depth MAX_BLOCKS (projection horizon), floored at minimum_fee
-    pub minimum_fee: f64,    // mempool_min_fee_sat_vb (relay floor)
-    pub as_of: u64,          // unix seconds this estimate was computed
+    pub next_block: f64,    // depth 1 block (~next block)
+    pub within_3_blocks: f64,  // depth 3 blocks (~30 min)
+    pub within_6_blocks: f64,       // depth 6 blocks (~1 hour)
+    pub horizon: f64,    // depth MAX_BLOCKS (projection horizon), floored at relay_floor
+    pub relay_floor: f64,    // mempool_min_fee_sat_vb (relay floor)
+    pub computed_at: u64,          // unix seconds this estimate was computed
 }
 ```
 
@@ -127,7 +127,7 @@ confirm within N blocks is the rate at which cumulative weight first reaches
 (`fastest ≥ half_hour ≥ hour ≥ economy`) and robust to gap-filler outliers. If the
 mempool holds less than N blocks of weight, anything at the relay floor confirms,
 so that tier is the floor. Depths (1 / 3 / 6 / `MAX_BLOCKS`) are named constants;
-`minimum_fee` = `mempool_min_fee_sat_vb`. All tunable without touching `gbt.rs`.
+`relay_floor` = `mempool_min_fee_sat_vb`. All tunable without touching `gbt.rs`.
 
 ## Integration with the sync loop
 
@@ -149,7 +149,7 @@ min-fee/tip) and after `bulk_resync`. Mechanics:
 - On completion, writes `fee_estimate` under `write_state`.
 
 `caught_up` gating: `/fees` is gated on `caught_up`, so it never serves a number
-computed from a mempool it can't vouch for. `as_of` is still included so callers
+computed from a mempool it can't vouch for. `computed_at` is still included so callers
 can see the estimate's age. This matches the README's stated contract.
 
 ## HTTP surface
@@ -170,7 +170,7 @@ One new knob in `src/config.rs`, following the existing clap/env pattern:
 - `FEE_RECOMPUTE_MIN_INTERVAL_MS` (default 5000, floored at `poll_interval`).
 
 Block count and weight are compile-time constants in `gbt.rs` (not configurable);
-`minimum_fee` reuses the existing `mempool_min_fee_sat_vb`.
+`relay_floor` reuses the existing `mempool_min_fee_sat_vb`.
 
 ## Testing
 
@@ -182,7 +182,7 @@ Block count and weight are compile-time constants in `gbt.rs` (not configurable)
     next block; final block unbounded.
   - Deterministic tie-break via `order`.
 - **`fees.rs` unit tests:** `Projection` → `FeeEstimate` tier mapping, including the
-  `minimum_fee` floor and the empty-mempool case.
+  `relay_floor` floor and the empty-mempool case.
 - **Simulation harness:** add a sim test that drives the sync loop against
   `MockNode` and asserts the produced `FeeEstimate` is populated and monotone
   (`fastest ≥ half_hour ≥ hour ≥ minimum`) and stays finite under churn. CPFP
