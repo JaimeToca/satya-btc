@@ -118,6 +118,8 @@ pub struct SyncConfig {
     /// Max fetch time per tick before bailing and marking the state stale
     /// (`caught_up = false`); the remainder is retried on the next tick.
     pub tick_budget: Duration,
+    /// Minimum time between fee-estimate recomputes (see `config`).
+    pub fee_recompute_min_interval: Duration,
 }
 
 /// Result of fetching (a capped slice of) this tick's new txids.

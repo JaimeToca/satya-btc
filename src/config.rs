@@ -35,6 +35,9 @@ pub struct Config {
     /// tiny value (e.g. `TICK_BUDGET_MS=0`) can't force a permanent backlog by
     /// bailing after the very first result.
     pub tick_budget: Duration,
+    /// Minimum time between fee-estimate recomputes. Default 5000ms, floored at
+    /// `poll_interval` so it never runs more often than the mempool refreshes.
+    pub fee_recompute_min_interval: Duration,
 }
 
 #[derive(Parser)]
@@ -66,6 +69,15 @@ struct Cli {
     /// 2 x POLL_INTERVAL_MS.
     #[arg(long, env = "TICK_BUDGET_MS")]
     tick_budget_ms: Option<u64>,
+    /// Minimum ms between fee-estimate recomputes (default 5000, floored at POLL_INTERVAL_MS).
+    #[arg(long, env = "FEE_RECOMPUTE_MIN_INTERVAL_MS")]
+    fee_recompute_min_interval_ms: Option<u64>,
+}
+
+/// Resolve the fee-recompute interval: default 5000ms, floored at the poll
+/// interval so recomputes never outpace the mempool refresh.
+fn fee_recompute_interval(requested_ms: Option<u64>, poll_ms: u64) -> Duration {
+    Duration::from_millis(requested_ms.unwrap_or(5000).max(poll_ms))
 }
 
 impl Config {
@@ -96,7 +108,28 @@ impl Config {
                     // and wedge the sync in permanent backlog.
                     .max(cli.poll_interval_ms),
             ),
+            fee_recompute_min_interval: fee_recompute_interval(
+                cli.fee_recompute_min_interval_ms,
+                cli.poll_interval_ms,
+            ),
         })
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fee_recompute_interval_floored_at_poll() {
+        // A tiny requested interval is floored at the poll interval.
+        let d = fee_recompute_interval(Some(100), 2000);
+        assert_eq!(d, Duration::from_millis(2000));
+        // A larger requested interval is honoured.
+        let d = fee_recompute_interval(Some(9000), 2000);
+        assert_eq!(d, Duration::from_millis(9000));
+        // Default (None) is 5000, still floored at poll.
+        let d = fee_recompute_interval(None, 2000);
+        assert_eq!(d, Duration::from_millis(5000));
+    }
+}

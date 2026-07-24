@@ -20,6 +20,7 @@ fn cfg() -> SyncConfig {
         poll_interval: Duration::from_millis(10),
         fetch_concurrency: 5,
         tick_budget: Duration::from_secs(30), // generous: budget bail isn't under test here
+        fee_recompute_min_interval: Duration::from_millis(2000),
     }
 }
 

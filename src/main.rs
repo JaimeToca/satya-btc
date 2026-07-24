@@ -90,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
         poll_interval: cfg.poll_interval,
         fetch_concurrency: cfg.fetch_concurrency,
         tick_budget: cfg.tick_budget,
+        fee_recompute_min_interval: cfg.fee_recompute_min_interval,
     };
     let sync_handle = tokio::spawn(sync::run(rpc, sync_state, sync_cfg, wake_rx));
 
