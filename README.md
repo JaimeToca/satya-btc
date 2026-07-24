@@ -15,7 +15,6 @@ binary. No database, no Redis, no explorer.
 - [Why Satya exists](#why-satya-exists)
 - [System design](#system-design)
   - [Building the mempool](#building-the-mempool)
-  - [Talking to the node: the JSON-RPC transport](#talking-to-the-node-the-json-rpc-transport)
   - [Estimating fees by simulating the next blocks](#estimating-fees-by-simulating-the-next-blocks)
   - [What bounds the accuracy of the estimate](#what-bounds-the-accuracy-of-the-estimate)
 - [Deployment](#deployment)
@@ -242,70 +241,6 @@ events collapses to a single pending tick.
 ZMQ is a raw socket on the node, so this path assumes a **local node** — which is
 the intended production deployment anyway. A local node plus ZMQ is the lowest
 latency possible: the estimate tracks reality instead of trailing it.
-
-### Talking to the node: the JSON-RPC transport
-
-Satya's RPC layer is a **hand-rolled async JSON-RPC client over `reqwest`**. We
-deliberately dropped the blocking `bitcoincore-rpc` client so the *entire* system
-is one async runtime — which is what makes true request cancellation (the
-budget-bail above) possible, since dropping a `reqwest` future actually cancels
-the in-flight request.
-
-It's small on purpose, and every design choice is about being **DRY** and safe
-against an **untrusted endpoint**. A remote provider is supported for bring-up (and
-production accuracy still wants a local node — see [Deployment](#deployment)), but
-the transport treats the far side as hostile regardless.
-
-- **One generic path.** Every typed method (`getblockchaininfo`,
-  `getmempoolinfo`, `getrawmempool`, `getmempoolentry`) funnels through a single
-  `call<T>` that builds the request, applies auth, sends it, and parses the
-  `{ result, error }` envelope exactly once. There is one place to get the
-  request/parse logic right.
-
-- **Streaming, tiered body caps.** `resp.bytes()` would materialize an entire
-  response with no bound, so an untrusted provider could OOM us. Instead `call`
-  reads the body as a **bounded stream** (checking `Content-Length` preflight
-  *and* enforcing the cap mid-stream, since Content-Length can lie), with three
-  tiers matched to expected response sizes:
-
-  | Tier             | Cap      | Used for                                   |
-  |------------------|----------|--------------------------------------------|
-  | control-plane    | 16 MiB   | `getblockchaininfo`, `getmempoolinfo`, one `getmempoolentry` |
-  | txid list        | 64 MiB   | `getrawmempool false` (bare id list)       |
-  | verbose          | 512 MiB  | `getrawmempool true` (full verbose dump)   |
-
-- **Error classification.** Bitcoin Core returns *method* errors as HTTP **500
-  with a valid JSON-RPC error body** (e.g. `getmempoolentry` on a vanished tx,
-  code **`-5`**). So `call` parses the envelope **regardless of HTTP status**,
-  and only treats the status itself as the error when the body isn't a parseable
-  envelope (a genuine gateway/WAF failure). Code `-5` is mapped to a clean "tx
-  vanished" → `Ok(None)` so the fetch loop treats it as "left the mempool", not a
-  hard error. 401/403 become a distinct reconnectable `Auth` error (rebuild the
-  client, re-read a possibly-rotated cookie, retry).
-
-- **Flexible auth.** Cookie file, `user`/`pass`, or **none** (when the endpoint
-  carries its credential in the URL, like a hosted provider's API key in the
-  path). Cookie takes precedence and is re-read on reconnect, so a node restart
-  that rotates the cookie doesn't wedge the loop on 401 forever.
-
-- **Provider-hardening.** `redirect(none)` — an untrusted provider must not be
-  able to redirect us (and our credentials) to another host. Every transport
-  error is built with `without_url()`, because `reqwest` does **not** redact a
-  path-embedded token (`https://host/<KEY>`) — so the token never reaches the
-  logs. Error strings are length-truncated on top of the body cap.
-
-- **Per-request timeout + cancel-on-drop.** The timeout is baked into the client;
-  dropping a call cancels it. No custom headers are added.
-
-- **Exact-integer money.** Core reports fees as BTC decimals; they're parsed via
-  serde's `as_btc` straight into the `bitcoin` crate's integer-sat `Amount`
-  (exact for every real sat value — ≤ 21M BTC fits an f64 mantissa). Fees are
-  **never** floating point. The only float in the system is the *fee rate*
-  (`mempool_min_fee_sat_vb`), where a rate is the appropriate representation.
-
-The `reqwest` client is internally connection-pooled (keep-alive), so a clone is
-cheap and concurrent fetches reuse connections rather than reopening one per
-call.
 
 ### Estimating fees by simulating the next blocks
 
