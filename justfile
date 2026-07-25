@@ -42,6 +42,18 @@ fmt:
 health:
     curl -s localhost:8080/health | jq
 
+# Tail sync-loop churn live (ticks, desync detection, bulk resync)
+logs-sync:
+    RUST_LOG=warn,satya::sync=debug cargo run
+
+# Warnings and errors only
+logs-errors:
+    RUST_LOG=warn cargo run
+
+# HTTP access logs only (method, path, status, latency)
+logs-http:
+    RUST_LOG=error,tower_http::trace=info cargo run
+
 # Build and run via docker compose
 docker:
     docker compose up --build

@@ -726,6 +726,32 @@ turning on debug logging.
 HTTP requests are logged via [`tower-http`](https://docs.rs/tower-http)'s
 `TraceLayer`, one INFO line per request with method, path, status, and latency.
 
+**Module-target map** — filter precisely by target instead of a blanket level:
+
+| Target | What it logs |
+|--------|--------------|
+| `satya::sync` | sync loop: caught_up transitions, desync/bulk resync, per-tick churn (debug), fee recompute (debug) |
+| `satya::rpc` | JSON-RPC transport errors |
+| `satya::zmq` | ZMQ block-listener connect/reconnect |
+| `tower_http::trace` | HTTP access log (method, path, status, latency) |
+
+**Real-time cheat-sheet** — copy-paste any of these to watch the process live:
+
+```bash
+RUST_LOG=info cargo run                          # default: quiet when healthy
+RUST_LOG=warn cargo run                          # errors/warnings only
+RUST_LOG=warn,satya::sync=debug cargo run        # watch sync churn only
+RUST_LOG=error,tower_http::trace=info cargo run  # HTTP access logs only
+RUST_LOG=info,tower_http::trace=warn cargo run   # app lifecycle, silence /health spam
+LOG_FORMAT=json RUST_LOG=info cargo run          # structured JSON for log aggregators
+# via just:
+just logs-sync   # sync churn    | just logs-errors   # errors    | just logs-http   # access logs
+```
+
+**Rotation.** Logs go to stdout; under systemd/Docker use `journalctl -u <svc> -f`
+/ `docker compose logs -f satya`, and rely on journald/Docker log rotation — satya
+doesn't write files.
+
 ---
 
 ## Engineering notes

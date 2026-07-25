@@ -23,7 +23,7 @@ const MAX_ERR_LOG_LEN: usize = 200;
 /// full source/cause chain; for other `Display` types it's just their message)
 /// and truncate it to `MAX_ERR_LOG_LEN` chars in a single pass, so oversized
 /// error bodies (e.g. from a misbehaving RPC provider) don't get logged in full.
-fn short_err<E: std::fmt::Display>(e: &E) -> String {
+pub(crate) fn short_err<E: std::fmt::Display>(e: &E) -> String {
     let full = format!("{e:#}");
     let mut chars = full.chars();
     let mut s: String = chars.by_ref().take(MAX_ERR_LOG_LEN).collect();
@@ -40,8 +40,9 @@ fn short_err<E: std::fmt::Display>(e: &E) -> String {
 /// on 401 forever. Non-reconnectable errors are left alone.
 fn reconnect_on_error<R: MempoolRpc + Clone + Send + Sync + 'static>(rpc: &mut R, e: &RpcError) {
     if rpc::is_reconnectable(e) {
-        if let Err(re) = rpc.reconnect() {
-            tracing::warn!(error = %short_err(&re), "rpc reconnect failed");
+        match rpc.reconnect() {
+            Ok(()) => tracing::info!("rpc reconnected"),
+            Err(re) => tracing::warn!(error = %short_err(&re), "rpc reconnect failed"),
         }
     }
 }
@@ -112,6 +113,7 @@ async fn maybe_recompute_fees(
     force: bool,
 ) {
     if !force && last.elapsed() < min_interval {
+        tracing::trace!("fee recompute throttled; skipping");
         return;
     }
     let (mut snapshot, min_fee) = {
@@ -127,10 +129,20 @@ async fn maybe_recompute_fees(
     // thus dense uid assignment / the projection's tie-breaks) would otherwise
     // vary run-to-run for the same mempool contents.
     snapshot.sort_by(|a, b| a.0.cmp(&b.0));
+    let n = snapshot.len();
     match tokio::task::spawn_blocking(move || crate::fees::compute_estimate(&snapshot, min_fee))
         .await
     {
         Ok(estimate) => {
+            tracing::debug!(
+                next_block = estimate.next_block,
+                within_3_blocks = estimate.within_3_blocks,
+                within_6_blocks = estimate.within_6_blocks,
+                horizon = estimate.horizon,
+                relay_floor = estimate.relay_floor,
+                txs = n,
+                "fee estimate recomputed"
+            );
             let mut g = write_state(state);
             g.fee_estimate = Some(estimate);
         }
