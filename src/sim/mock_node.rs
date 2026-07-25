@@ -79,9 +79,15 @@ impl MockNode {
     pub fn advance(&mut self) {
         self.reloading = false;
         for _ in 0..self.cfg.evictions_per_tick {
-            if let Some(&victim) = self.txs.keys().next() {
-                self.txs.remove(&victim);
+            let Some(start) = self.txs.keys().next().copied() else {
+                break;
+            };
+            // Descend the linear chain to its leaf so we never orphan a child.
+            let mut leaf = start;
+            while let Some(child) = self.children.get(&leaf).copied() {
+                leaf = child;
             }
+            self.remove_leaf(leaf);
         }
         for _ in 0..self.cfg.arrivals_per_tick {
             self.add_arrival();
@@ -94,9 +100,16 @@ impl MockNode {
 
     pub fn mass_drop(&mut self, fraction: f64) {
         let target = ((self.txs.len() as f64) * fraction) as usize;
-        let victims: Vec<Txid> = self.txs.keys().take(target).copied().collect();
-        for v in victims {
-            self.txs.remove(&v);
+        for _ in 0..target {
+            let Some(start) = self.txs.keys().next().copied() else {
+                break;
+            };
+            // Descend the linear chain to its leaf so we never orphan a child.
+            let mut leaf = start;
+            while let Some(child) = self.children.get(&leaf).copied() {
+                leaf = child;
+            }
+            self.remove_leaf(leaf);
         }
     }
 
@@ -268,6 +281,32 @@ impl MockNode {
         }
     }
 
+    /// Remove a leaf tx (one with no in-mempool child), keeping the children index
+    /// and every ancestor's descendant aggregates consistent. No-op if `leaf` is
+    /// absent or still has a child.
+    fn remove_leaf(&mut self, leaf: Txid) {
+        if self.children.contains_key(&leaf) {
+            return; // not a leaf
+        }
+        let Some(entry) = self.txs.remove(&leaf) else {
+            return;
+        };
+        let vsize = entry.vsize;
+        let base = entry.fees.base;
+        if let Some(parent) = entry.depends.first().copied() {
+            self.children.remove(&parent);
+            // Subtract this leaf from the parent AND every ancestor above it.
+            let mut chain = vec![parent];
+            chain.extend(self.ancestors_of(&parent));
+            for a in chain {
+                if let Some(e) = self.txs.get_mut(&a) {
+                    e.descendantsize = e.descendantsize.saturating_sub(vsize);
+                    e.fees.descendant = e.fees.descendant.checked_sub(base).unwrap_or(Amount::ZERO);
+                }
+            }
+        }
+    }
+
     /// One arrival: attach a CPFP child with probability `cpfp_fraction` when an
     /// eligible parent exists; otherwise insert a standalone tx.
     fn add_arrival(&mut self) {
@@ -433,6 +472,48 @@ mod tests {
         for (_txid, e) in n.raw_mempool_verbose().await.unwrap() {
             let sat_vb = e.fees.base.to_sat() / e.vsize.max(1);
             assert!((1..=500).contains(&sat_vb), "fee {sat_vb} sat/vB out of range");
+        }
+    }
+
+    #[tokio::test]
+    async fn churn_eviction_never_orphans_a_child() {
+        let cfg = ChurnConfig {
+            arrivals_per_tick: 40,
+            evictions_per_tick: 40,
+            fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 100 },
+            cpfp_fraction: 0.5,
+            max_chain: 3,
+        };
+        let mut node = MockNode::new(99, 500, cfg);
+        for _ in 0..20 {
+            node.advance();
+            // Invariant after every tick: every child's parent is still present.
+            for (_txid, e) in node.raw_mempool_verbose().await.unwrap() {
+                if let Some(parent) = e.depends.first() {
+                    assert!(
+                        node.entry_by_txid(parent).is_some(),
+                        "eviction orphaned a child (parent gone)"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mass_drop_never_orphans_and_shrinks() {
+        let cfg = ChurnConfig {
+            arrivals_per_tick: 0, evictions_per_tick: 0,
+            fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 100 },
+            cpfp_fraction: 0.5, max_chain: 3,
+        };
+        let mut node = MockNode::new(42, 400, cfg);
+        let before = node.len();
+        node.mass_drop(0.5);
+        assert!(node.len() < before, "mass_drop must shrink the mempool");
+        for (_txid, e) in node.raw_mempool_verbose().await.unwrap() {
+            if let Some(parent) = e.depends.first() {
+                assert!(node.entry_by_txid(parent).is_some(), "mass_drop orphaned a child");
+            }
         }
     }
 
