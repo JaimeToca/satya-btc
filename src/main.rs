@@ -61,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
                         "initial network() probe failed with a reconnectable error; reconnecting and retrying"
                     );
                     if let Err(re) = rpc.reconnect() {
-                        tracing::warn!(error = %re, "rpc reconnect failed");
+                        tracing::warn!(error = %crate::sync::short_err(&re), "rpc reconnect failed");
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     attempt += 1;

@@ -731,7 +731,7 @@ HTTP requests are logged via [`tower-http`](https://docs.rs/tower-http)'s
 | Target | What it logs |
 |--------|--------------|
 | `satya::sync` | sync loop: caught_up transitions, desync/bulk resync, per-tick churn (debug), fee recompute (debug) |
-| `satya::rpc` | JSON-RPC transport errors |
+| `satya::rpc` | RPC auth-failure diagnostics (most transport/RPC errors log under `satya::sync`) |
 | `satya::zmq` | ZMQ block-listener connect/reconnect |
 | `tower_http::trace` | HTTP access log (method, path, status, latency) |
 
