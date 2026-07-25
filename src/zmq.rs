@@ -44,7 +44,7 @@ pub async fn spawn_block_listener(endpoint: String, wake_tx: Sender<()>) {
             Err(e) => {
                 tracing::warn!(
                     endpoint = %endpoint,
-                    error = %e,
+                    error = %crate::sync::short_err(&e),
                     backoff_secs = backoff.as_secs(),
                     "zmq block listener error; backing off and reconnecting"
                 );
