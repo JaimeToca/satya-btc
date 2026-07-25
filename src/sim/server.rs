@@ -219,7 +219,7 @@ fn verbose_entry_json(e: &crate::rpc::MempoolEntry) -> Value {
     json!({
         "vsize": e.vsize,
         "weight": e.weight,
-        "depends": Vec::<String>::new(),
+        "depends": e.depends.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
         "fees": {
             "base": e.fees.base.to_btc(),
             "ancestor": e.fees.ancestor.to_btc(),
@@ -255,6 +255,12 @@ struct SimServeArgs {
     /// 0 = never.
     #[arg(long, default_value_t = 0)]
     reload_every: u32,
+    /// Fraction of arrivals that attach as a CPFP child (0 = no packages).
+    #[arg(long, default_value_t = 0.15)]
+    cpfp_fraction: f64,
+    /// Max linear chain length (1 = no chaining).
+    #[arg(long, default_value_t = 3)]
+    max_chain: usize,
 }
 
 /// Entry point for `main.rs`'s `sim-serve` guard: parses the sim flags,
@@ -273,8 +279,8 @@ pub async fn run_cli() -> anyhow::Result<()> {
         arrivals_per_tick: args.arrivals,
         evictions_per_tick: args.evictions,
         fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 500 },
-        cpfp_fraction: 0.15,
-        max_chain: 3,
+        cpfp_fraction: args.cpfp_fraction,
+        max_chain: args.max_chain,
     };
     let node = MockNode::new(0, args.size, churn);
     let profile = if args.profile == "remote" {

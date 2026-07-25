@@ -63,4 +63,30 @@ mod tests {
         let info = rpc.mempool_info().await.unwrap();
         assert_eq!(info.loaded, Some(false), "reload must surface loaded:false over HTTP");
     }
+
+    #[tokio::test]
+    async fn real_client_receives_depends_over_http() {
+        use crate::sim::{ChurnConfig, FeeDistribution};
+        // cpfp_fraction=1.0 so the node builds chains; find a tx with a parent.
+        let n = MockNode::new(
+            3,
+            50,
+            ChurnConfig {
+                arrivals_per_tick: 0,
+                evictions_per_tick: 0,
+                fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 100 },
+                cpfp_fraction: 1.0,
+                max_chain: 3,
+            },
+        );
+        let addr = server::spawn(n, NetworkProfile::local_node(), 0, 0, 0)
+            .await
+            .unwrap();
+        let rpc = client(addr);
+        let entries = rpc.raw_mempool_verbose().await.unwrap();
+        assert!(
+            entries.iter().any(|(_txid, e)| !e.depends.is_empty()),
+            "verbose mempool over HTTP must carry real depends"
+        );
+    }
 }
