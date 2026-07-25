@@ -778,7 +778,13 @@ The design principles the code holds itself to:
   routing — because that's where the subtle correctness lives; the loop around it
   is I/O.
 
+## Support
+
+If Satya is useful to you, you can support development:
+[☕ Buy me a coffee](https://buymeacoffee.com/jaimetoca).
+
 ## License
 
-See [LICENSE](LICENSE) if present; otherwise this is currently unlicensed /
-private.
+[MIT](LICENSE) © 2026 Jaime Toca. Satya is an independent implementation of
+Bitcoin Core's (MIT-licensed) block-assembly algorithm; no third-party code is
+vendored.
