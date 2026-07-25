@@ -322,9 +322,16 @@ pub async fn run_cli() -> anyhow::Result<()> {
 
     // NaN -> default; floor at a small positive so k stays > 0.
     let fee_skew = if args.fee_skew.is_nan() {
+        tracing::warn!("--fee-skew was NaN; using default 3.0");
         3.0
+    } else if args.fee_skew < 0.1 {
+        tracing::warn!(
+            requested = args.fee_skew,
+            "--fee-skew below 0.1; flooring to 0.1"
+        );
+        0.1
     } else {
-        args.fee_skew.max(0.1)
+        args.fee_skew
     };
 
     let churn = ChurnConfig {

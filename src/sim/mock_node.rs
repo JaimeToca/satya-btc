@@ -7,14 +7,17 @@ use rand::{Rng, SeedableRng};
 use crate::rpc::{MempoolEntry, MempoolEntryFees, MempoolInfo, MempoolRpc, RpcError};
 
 /// Inclusive sat/vB range synthetic fees are drawn from, with a power-law `skew`
-/// controlling the shape (1.0 = uniform; > 1.0 piles draws near the floor).
+/// controlling the shape (1.0 = uniform; > 1.0 piles draws near the floor;
+/// `0 < skew < 1` biases draws toward the ceiling instead — the inverse shape).
 #[derive(Clone, Copy)]
 pub struct FeeDistribution {
-    pub min_sat_vb: u64,
-    pub max_sat_vb: u64,
+    pub(crate) min_sat_vb: u64,
+    pub(crate) max_sat_vb: u64,
     /// Power-law skew exponent for the fee-rate draw. 1.0 = uniform; > 1.0 biases
-    /// draws toward the floor (the realistic "wall at the relay floor").
-    pub skew: f64,
+    /// draws toward the floor (the realistic "wall at the relay floor"); `0 < skew
+    /// < 1` biases draws toward the ceiling instead. Always finite and > 0.0 —
+    /// enforced by the `skewed()` constructor, since this field is `pub(crate)`.
+    pub(crate) skew: f64,
 }
 
 impl FeeDistribution {
@@ -28,6 +31,14 @@ impl FeeDistribution {
     }
     /// Power-law-skewed fee-rates over [min, max]. `skew > 1.0` piles draws near the floor.
     pub fn skewed(min_sat_vb: u64, max_sat_vb: u64, skew: f64) -> Self {
+        // Enforce a positive, finite exponent so `sample_fee_rate` can't hit
+        // `u.powf(<=0)` / NaN (which would invert or blow up the shape). An
+        // invalid skew degrades to uniform — the invariant lives with the type.
+        let skew = if skew.is_finite() && skew > 0.0 {
+            skew
+        } else {
+            1.0
+        };
         Self {
             min_sat_vb,
             max_sat_vb,
@@ -427,7 +438,9 @@ impl MockNode {
 
     /// Draw a standalone tx's fee-rate (sat/vB) from a bounded power-law over
     /// `[min, max]`: `rate = min + (max - min) * u^skew`. `skew == 1.0` is uniform;
-    /// `skew > 1.0` piles draws near the floor. All randomness from the seeded rng.
+    /// `skew > 1.0` piles draws near the floor; `0 < skew < 1` biases draws toward
+    /// the ceiling instead (the inverse shape). `max <= min` short-circuits to
+    /// `min`. All randomness from the seeded rng.
     fn sample_fee_rate(&mut self) -> u64 {
         let FeeDistribution {
             min_sat_vb: min,
@@ -847,10 +860,7 @@ mod tests {
             }
         }
         let frac = f64::from(in_bottom_quarter) / f64::from(n);
-        assert!(
-            frac > 0.55,
-            "skewed draw should pile low: {frac} in bottom quarter (uniform ~0.25)"
-        );
+        assert!((0.55..0.80).contains(&frac), "skewed draw should pile low but not collapse: {frac} in bottom quarter (uniform ~0.25, k=3 true ~0.63)");
     }
 
     #[test]
@@ -878,6 +888,30 @@ mod tests {
             (0.15..0.35).contains(&frac),
             "uniform draw should be ~0.25 in bottom quarter, got {frac}"
         );
+    }
+
+    #[test]
+    fn skewed_constructor_sanitizes_bad_exponents() {
+        assert_eq!(FeeDistribution::skewed(1, 500, -2.0).skew, 1.0);
+        assert_eq!(FeeDistribution::skewed(1, 500, 0.0).skew, 1.0);
+        assert_eq!(FeeDistribution::skewed(1, 500, f64::NAN).skew, 1.0);
+        assert_eq!(FeeDistribution::skewed(1, 500, f64::INFINITY).skew, 1.0);
+        assert_eq!(FeeDistribution::skewed(1, 500, 3.0).skew, 3.0);
+    }
+
+    #[test]
+    fn sample_fee_rate_handles_min_equals_max() {
+        let cfg = ChurnConfig {
+            arrivals_per_tick: 0,
+            evictions_per_tick: 0,
+            fee: FeeDistribution::uniform(5, 5),
+            cpfp_fraction: 0.0,
+            max_chain: 1,
+        };
+        let mut node = MockNode::new(1, 1, cfg);
+        for _ in 0..100 {
+            assert_eq!(node.sample_fee_rate(), 5);
+        }
     }
 
     #[tokio::test]
