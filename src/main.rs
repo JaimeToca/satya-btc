@@ -14,11 +14,17 @@ use std::sync::{Arc, RwLock};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let json = std::env::var("LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    if json {
+        builder.json().init();
+    } else {
+        builder.init();
+    }
 
     // Feature-gated `sim-serve` entrypoint: serves an offline MockNode over
     // HTTP instead of booting the real indexer. The production CLI
@@ -51,11 +57,11 @@ async fn main() -> anyhow::Result<()> {
                     tracing::warn!(
                         attempt,
                         max_attempts = MAX_ATTEMPTS,
-                        error = %e,
+                        error = %crate::sync::short_err(&e),
                         "initial network() probe failed with a reconnectable error; reconnecting and retrying"
                     );
                     if let Err(re) = rpc.reconnect() {
-                        tracing::warn!(error = %re, "rpc reconnect failed");
+                        tracing::warn!(error = %crate::sync::short_err(&re), "rpc reconnect failed");
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     attempt += 1;

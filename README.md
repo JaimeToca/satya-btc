@@ -10,6 +10,8 @@ copy of the mempool, synced directly from your node, and simulates the next few
 blocks the way a miner would to read fee tiers off that simulation. One static
 binary. No database, no Redis, no explorer.
 
+> ⚠️ **Status: active development.** Satya is pre-1.0 and evolving — the API (including `/fees` output), config flags, and behavior may change without notice. Not yet recommended for production reliance.
+
 ## Contents
 
 - [Why Satya exists](#why-satya-exists)
@@ -723,6 +725,32 @@ turning on debug logging.
 HTTP requests are logged via [`tower-http`](https://docs.rs/tower-http)'s
 `TraceLayer`, one INFO line per request with method, path, status, and latency.
 
+**Module-target map** — filter precisely by target instead of a blanket level:
+
+| Target | What it logs |
+|--------|--------------|
+| `satya::sync` | sync loop: caught_up transitions, desync/bulk resync, per-tick churn (debug), fee recompute (debug) |
+| `satya::rpc` | RPC auth-failure diagnostics (most transport/RPC errors log under `satya::sync`) |
+| `satya::zmq` | ZMQ block-listener connect/reconnect |
+| `tower_http::trace` | HTTP access log (method, path, status, latency) |
+
+**Real-time cheat-sheet** — copy-paste any of these to watch the process live:
+
+```bash
+RUST_LOG=info cargo run                          # default: quiet when healthy
+RUST_LOG=warn cargo run                          # errors/warnings only
+RUST_LOG=warn,satya::sync=debug cargo run        # watch sync churn only
+RUST_LOG=error,tower_http::trace=info cargo run  # HTTP access logs only
+RUST_LOG=info,tower_http::trace=warn cargo run   # app lifecycle, silence /health spam
+LOG_FORMAT=json RUST_LOG=info cargo run          # structured JSON for log aggregators
+# via just:
+just logs-sync   # sync churn    | just logs-errors   # errors    | just logs-http   # access logs
+```
+
+**Rotation.** Logs go to stdout; under systemd/Docker use `journalctl -u <svc> -f`
+/ `docker compose logs -f satya`, and rely on journald/Docker log rotation — satya
+doesn't write files.
+
 ---
 
 ## Engineering notes
@@ -750,7 +778,13 @@ The design principles the code holds itself to:
   routing — because that's where the subtle correctness lives; the loop around it
   is I/O.
 
+## Support
+
+If Satya is useful to you, you can support development:
+[☕ Buy me a coffee](https://buymeacoffee.com/jaimetoca).
+
 ## License
 
-See [LICENSE](LICENSE) if present; otherwise this is currently unlicensed /
-private.
+[MIT](LICENSE) © 2026 Jaime Toca. Satya is an independent implementation of
+Bitcoin Core's (MIT-licensed) block-assembly algorithm; no third-party code is
+vendored.
