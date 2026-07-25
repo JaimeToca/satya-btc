@@ -125,7 +125,11 @@ impl MockNode {
     /// Confirm every tx in `set` (assumed ancestor-closed), then re-root any
     /// survivor whose parent was confirmed: clear its depends and reset ancestor
     /// aggregates to its own. Descendant aggregates of confirmed ancestors need no
-    /// repair — they leave with them.
+    /// repair — they leave with them. Chains are linear, so after re-rooting we
+    /// also walk DOWN each new root's surviving `children` chain, recomputing
+    /// every descendant's ancestor aggregates from its (now-correct) parent —
+    /// otherwise a surviving grandchild would keep counting a confirmed
+    /// great-ancestor that no longer exists.
     fn confirm_set(&mut self, set: &HashSet<Txid>) {
         let reroot: Vec<Txid> = self
             .txs
@@ -149,6 +153,23 @@ impl MockNode {
         for t in set {
             self.txs.remove(t);
             self.children.remove(t);
+        }
+        // Repair stale ancestor aggregates on every descendant below each new
+        // root: walk the linear children chain, recomputing each child from its
+        // already-correct parent.
+        for root in reroot {
+            let mut parent = root;
+            while let Some(child) = self.children.get(&parent).copied() {
+                let (parent_ancestorsize, parent_fees_ancestor) = {
+                    let p = &self.txs[&parent];
+                    (p.ancestorsize, p.fees.ancestor)
+                };
+                if let Some(c) = self.txs.get_mut(&child) {
+                    c.ancestorsize = c.vsize + parent_ancestorsize;
+                    c.fees.ancestor = c.fees.base + parent_fees_ancestor;
+                }
+                parent = child;
+            }
         }
     }
 
@@ -612,6 +633,136 @@ mod tests {
             .min()
             .unwrap();
         assert_eq!(min_rate_after, min_rate_before, "lowest-fee tx must survive");
+    }
+
+    #[tokio::test]
+    async fn confirm_set_recomputes_grandchild_ancestor_aggregates() {
+        // Find a length-3 linear chain a -> b -> c (a's depends empty, b depends
+        // on a, c depends on b) so confirming only `a` leaves `b` re-rooted and
+        // `c` a surviving grandchild whose stale aggregates must be repaired.
+        let mut node = MockNode::new(11, 400, cpfp_cfg());
+        let mut found: Option<(Txid, Txid, Txid)> = None;
+        for (a, ea) in node.snapshot_entries() {
+            if !ea.depends.is_empty() {
+                continue;
+            }
+            let Some(b) = node.child_of(&a) else { continue };
+            let Some(c) = node.child_of(&b) else { continue };
+            found = Some((a, b, c));
+            break;
+        }
+        let (a, b, c) = found.expect(
+            "expected at least one length-3 chain a->b->c with cpfp_fraction=1.0, max_chain=3",
+        );
+
+        let b_before = node.entry_by_txid(&b).unwrap();
+        let c_before = node.entry_by_txid(&c).unwrap();
+        let a_entry = node.entry_by_txid(&a).unwrap();
+
+        // Sanity: before confirming, c's aggregates DO include a's contribution.
+        assert_eq!(
+            c_before.ancestorsize,
+            c_before.vsize + b_before.vsize + a_entry.vsize
+        );
+
+        node.confirm_set(&HashSet::from([a]));
+
+        // a is gone.
+        assert!(node.entry_by_txid(&a).is_none());
+
+        // b was re-rooted: depends cleared, ancestor aggregates equal its own.
+        let b_after = node.entry_by_txid(&b).expect("b must survive");
+        assert!(b_after.depends.is_empty(), "b must be re-rooted (depends cleared)");
+        assert_eq!(b_after.ancestorsize, b_after.vsize);
+        assert_eq!(b_after.fees.ancestor, b_after.fees.base);
+
+        // c survives with b still as its parent, but its ancestor aggregates must
+        // be recomputed to drop a's now-confirmed contribution.
+        let c_after = node.entry_by_txid(&c).expect("c must survive");
+        assert_eq!(c_after.depends, vec![b]);
+        assert_eq!(
+            c_after.ancestorsize,
+            c_after.vsize + b_after.ancestorsize,
+            "c.ancestorsize must no longer count the confirmed root a"
+        );
+        assert_eq!(
+            c_after.fees.ancestor,
+            c_after.fees.base + b_after.fees.ancestor,
+            "c.fees.ancestor must no longer count the confirmed root a"
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregates_stay_truthful_across_churn_and_mine_cycles() {
+        let cfg = ChurnConfig {
+            arrivals_per_tick: 60,
+            evictions_per_tick: 20,
+            fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 100 },
+            cpfp_fraction: 0.6,
+            max_chain: 3,
+        };
+        let mut node = MockNode::new(2024, 400, cfg);
+
+        // Assert the truthful-aggregate invariant over EVERY survivor: each
+        // child's ancestor totals equal its own plus its (present) parent's;
+        // each root's equal its own.
+        fn assert_invariant(node: &MockNode) {
+            for (txid, e) in node.snapshot_entries() {
+                if let Some(parent) = e.depends.first().copied() {
+                    let p = node
+                        .entry_by_txid(&parent)
+                        .unwrap_or_else(|| panic!("{txid:?}'s parent {parent:?} must be present"));
+                    assert_eq!(
+                        e.ancestorsize,
+                        e.vsize + p.ancestorsize,
+                        "ancestorsize drift for {txid:?}"
+                    );
+                    assert_eq!(
+                        e.fees.ancestor,
+                        e.fees.base + p.fees.ancestor,
+                        "fees.ancestor drift for {txid:?}"
+                    );
+                } else {
+                    assert_eq!(e.ancestorsize, e.vsize, "root ancestorsize drift for {txid:?}");
+                    assert_eq!(
+                        e.fees.ancestor, e.fees.base,
+                        "root fees.ancestor drift for {txid:?}"
+                    );
+                }
+            }
+        }
+
+        let mut forced_partial_confirms = 0usize;
+        for _ in 0..15 {
+            node.advance();
+            // Deterministically drive the partial-confirmation path: when a
+            // length->=3 chain exists, confirm ONLY its root, leaving a surviving
+            // grandchild whose ancestor aggregates must be recomputed. This is the
+            // exact drift scenario; mine_block reaches it only rarely under this
+            // seed, so force it directly to give the guard teeth. Assert the
+            // invariant IMMEDIATELY after the forced confirm — before the ensuing
+            // mine_block/eviction can mask a stale grandchild by removing it.
+            let root_with_grandchild = node.snapshot_entries().into_iter().find_map(|(a, ea)| {
+                if !ea.depends.is_empty() {
+                    return None;
+                }
+                let b = node.child_of(&a)?;
+                node.child_of(&b)?; // grandchild must exist
+                Some(a)
+            });
+            if let Some(a) = root_with_grandchild {
+                node.confirm_set(&HashSet::from([a]));
+                forced_partial_confirms += 1;
+                assert_invariant(&node);
+            }
+            node.mine_block();
+            assert_invariant(&node);
+        }
+        assert!(
+            forced_partial_confirms > 0,
+            "test must exercise the partial-confirm path at least once"
+        );
+        assert_invariant(&node);
     }
 
     #[tokio::test]
