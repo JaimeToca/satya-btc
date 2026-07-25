@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bitcoin::{Amount, Txid};
 use rand::rngs::StdRng;
@@ -113,37 +113,89 @@ impl MockNode {
         }
     }
 
+    /// Ancestor-package effective rate (sat/vB): min(own_rate, package_rate), using
+    /// the entry's ancestor aggregates as the package totals — mirrors gbt.rs.
+    fn effective_rate(&self, t: &Txid) -> u64 {
+        let e = &self.txs[t];
+        let own = own_rate_sat_vb(e);
+        let pkg = e.fees.ancestor.to_sat() / e.ancestorsize.max(1);
+        own.min(pkg)
+    }
+
+    /// Confirm every tx in `set` (assumed ancestor-closed), then re-root any
+    /// survivor whose parent was confirmed: clear its depends and reset ancestor
+    /// aggregates to its own. Descendant aggregates of confirmed ancestors need no
+    /// repair — they leave with them.
+    fn confirm_set(&mut self, set: &HashSet<Txid>) {
+        let reroot: Vec<Txid> = self
+            .txs
+            .keys()
+            .filter(|t| !set.contains(*t))
+            .filter(|t| {
+                self.txs[*t]
+                    .depends
+                    .first()
+                    .is_some_and(|p| set.contains(p))
+            })
+            .copied()
+            .collect();
+        for t in &reroot {
+            if let Some(e) = self.txs.get_mut(t) {
+                e.depends.clear();
+                e.ancestorsize = e.vsize;
+                e.fees.ancestor = e.fees.base;
+            }
+        }
+        for t in set {
+            self.txs.remove(t);
+            self.children.remove(t);
+        }
+    }
+
     /// Simulate a confirmed block: advance the tip and confirm the highest
-    /// fee-rate txs up to one block's weight budget (~4M weight units), the way
-    /// a real miner fills a block from the top of the fee market. Deterministic
-    /// for a given mempool: ties on fee-rate break on txid. The lowest-fee txs
-    /// are left behind, so `/fees` dips after a block and recovers as churn refills.
+    /// effective-rate ancestor packages up to one block's weight budget, mirroring
+    /// how a real miner fills a block. Confirms whole ancestor sets (never a child
+    /// without its parent); the tip advances by one.
     pub fn mine_block(&mut self) {
         const BLOCK_WEIGHT: u64 = 4_000_000;
         self.tip_height += 1;
 
-        // Rank candidates by fee-rate (sat/vB) descending; tie-break on txid so
-        // the selection is reproducible regardless of HashMap iteration order.
-        let mut ranked: Vec<(Txid, u64, u64)> = self
-            .txs
-            .iter()
-            .map(|(txid, e)| {
-                let vsize = e.vsize.max(1);
-                let sat_vb = e.fees.base.to_sat() / vsize;
-                let weight = e.weight.unwrap_or(vsize * 4);
-                (*txid, sat_vb, weight)
-            })
-            .collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let uids: Vec<Txid> = self.txs.keys().copied().collect();
+        let mut ranked: Vec<(u64, Txid)> =
+            uids.iter().map(|t| (self.effective_rate(t), *t)).collect();
+        // Descending effective rate; tie-break on txid for reproducibility.
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
 
         let mut used = 0u64;
-        for (txid, _rate, weight) in ranked {
-            if used + weight > BLOCK_WEIGHT {
-                break;
+        let mut confirmed: HashSet<Txid> = HashSet::new();
+        for (_score, t) in ranked {
+            if confirmed.contains(&t) {
+                continue;
             }
-            used += weight;
-            self.txs.remove(&txid);
+            // Package = this tx + its not-yet-confirmed ancestors.
+            let mut pkg = vec![t];
+            pkg.extend(
+                self.ancestors_of(&t)
+                    .into_iter()
+                    .filter(|a| !confirmed.contains(a)),
+            );
+            let pkg_weight: u64 = pkg
+                .iter()
+                .map(|x| {
+                    let e = &self.txs[x];
+                    e.weight.unwrap_or(e.vsize * 4)
+                })
+                .sum();
+            if used + pkg_weight > BLOCK_WEIGHT {
+                continue;
+            }
+            used += pkg_weight;
+            for x in pkg {
+                confirmed.insert(x);
+            }
         }
+
+        self.confirm_set(&confirmed);
     }
 
     pub fn len(&self) -> usize {
@@ -560,5 +612,30 @@ mod tests {
             .min()
             .unwrap();
         assert_eq!(min_rate_after, min_rate_before, "lowest-fee tx must survive");
+    }
+
+    #[tokio::test]
+    async fn mine_block_confirms_whole_packages_and_never_orphans() {
+        let cfg = ChurnConfig {
+            arrivals_per_tick: 0,
+            evictions_per_tick: 0,
+            fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 100 },
+            cpfp_fraction: 1.0,
+            max_chain: 3,
+        };
+        let mut node = MockNode::new(5, 300, cfg);
+        let tip_before = node.tip_height_sync();
+        node.mine_block();
+        assert_eq!(node.tip_height_sync(), tip_before + 1);
+        // No survivor may reference a parent that is gone (a confirmed parent must
+        // have been re-rooted: its child's depends cleared).
+        for (_txid, e) in node.raw_mempool_verbose().await.unwrap() {
+            if let Some(parent) = e.depends.first() {
+                assert!(
+                    node.entry_by_txid(parent).is_some(),
+                    "mine_block left a survivor whose parent was confirmed"
+                );
+            }
+        }
     }
 }
