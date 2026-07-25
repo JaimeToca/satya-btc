@@ -109,10 +109,10 @@ is an infinite loop that only ends via panic; if it ever does, the process
 silently freezing while still cheerfully serving `/health`. A frozen-but-healthy
 process is worse than a clean crash.
 
-The subsections below cover the four parts of that design in turn: **building the
-mempool** (the in-memory view of the node), **talking to the node** (the JSON-RPC
-transport that feeds it), **estimating fees** (the block simulation that reads
-tiers off that mempool), and **what bounds the accuracy** of the result.
+The subsections below cover the three parts of that design in turn: **building the
+mempool** (the in-memory view of the node), **estimating fees** (the block
+simulation that reads tiers off that mempool), and **what bounds the accuracy** of
+the result.
 
 ### Building the mempool
 
