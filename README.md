@@ -559,9 +559,23 @@ feature, so the release binary ships none of it.
 
 Three terminals:
 
-    just simulate          # fake node on :18443 — blocks every 30s + mempool churn
-    just sim-run           # the REAL indexer, pointed at :18443, API on :8080
-    just watch             # live /health + /fees every 2s
+    just simulate           # fake node on :18443, local profile — blocks every 30s + mempool churn
+    just sim-run            # the REAL indexer, pointed at :18443, API on :8080
+    just watch              # live /health + /fees every 2s
+
+`just simulate` uses the `local` profile (no throttling), so the indexer keeps
+up in real time: `/health` reports `caught_up: true` and `/fees` populates
+within a few ticks. To reproduce a throttled remote provider instead — where
+the indexer falls behind and `/fees` returns `503` while `caught_up: false` —
+run `just simulate-throttled` in place of `just simulate`:
+
+    just simulate-throttled  # fake node on :18443, throttled remote profile — reproduces the sync backlog
+
+While the sim node runs, its own log (the terminal running `just simulate` /
+`just simulate-throttled`) prints an INFO `sim: mined block ...` line each
+time it mines a block (tip height, txs confirmed, resulting mempool size);
+with `--reload-every N` it also prints a WARN `sim: node reload ...` line
+whenever it simulates a node restart.
 
 Tuning the fake node (restart `sim-serve` to change):
 
@@ -574,8 +588,9 @@ Tuning the fake node (restart `sim-serve` to change):
 
 What to look for while `just watch` runs:
 
-- `--profile remote` → `caught_up` flips to `false` (reproduces the throttled-
-  provider backlog); `--profile local` stays caught up.
+- `--profile remote` (`just simulate-throttled`) → `caught_up` flips to
+  `false` (reproduces the throttled-provider backlog); `--profile local`
+  (`just simulate`) stays caught up.
 - `/fees` populates within a few ticks; tiers are monotone (higher confirmation
   target ⇒ lower fee) and dip on each mined block, then recover as churn refills.
 - `--reload-every N` → the mempool collapses and `caught_up` briefly drops, then

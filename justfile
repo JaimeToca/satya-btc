@@ -30,9 +30,13 @@ clippy:
 test:
     cargo test --features simulation
 
-# Run the offline simulated node: blocks every 30s, mempool churn, on :18443
+# Run the offline simulated node (indexer will catch up): local profile, blocks every 30s + CPFP churn, on :18443
 simulate:
-    cargo run --features simulation -- sim-serve --block-secs 30
+    cargo run --features simulation -- sim-serve --profile local --block-secs 30
+
+# Like `simulate` but with the throttled remote-provider profile — reproduces the sync backlog (caught_up stays false)
+simulate-throttled:
+    cargo run --features simulation -- sim-serve --profile remote --block-secs 30
 
 # Format the code
 fmt:

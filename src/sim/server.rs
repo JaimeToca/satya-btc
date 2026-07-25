@@ -95,14 +95,27 @@ pub async fn spawn(
             let mut n = state.node.lock().unwrap();
             n.advance();
             if tpb != 0 && tick.is_multiple_of(tpb) {
+                let before = n.len();
                 n.mine_block();
                 blocks += 1;
+                tracing::info!(
+                    tip = n.tip_height_sync(),
+                    confirmed = before.saturating_sub(n.len()),
+                    mempool = n.len(),
+                    "sim: mined block"
+                );
                 if reload_every != 0 && blocks.is_multiple_of(reload_every) {
                     // Node-restart disruption: drop most of the mempool and
                     // report loaded:false for the next poll.
                     n.mass_drop(0.8);
                     n.reload();
+                    tracing::warn!(
+                        mempool = n.len(),
+                        "sim: node reload — mempool mass-dropped, reporting loaded=false for one poll"
+                    );
                 }
+            } else if tick.is_multiple_of(10) {
+                tracing::debug!(mempool = n.len(), tip = n.tip_height_sync(), "sim: churn");
             }
         }
     });
