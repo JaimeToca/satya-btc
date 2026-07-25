@@ -553,8 +553,10 @@ mainnet levels. Treat it as a functional check, not a production estimate.
 
 You can exercise the entire indexer — the real `reqwest` client, sync loop, fee
 engine, and HTTP API — against an offline fake node, with no Bitcoin Core. The
-sim node churns a mempool, mines blocks (confirming top-fee txs and advancing
-the tip), and can simulate a node restart. Everything is behind the `simulation`
+sim node churns a mempool of realistic CPFP transaction packages (low-fee
+parents lifted by high-fee children), mines blocks (confirming whole top
+fee-rate ancestor packages and advancing the tip), and can simulate a node
+restart. Everything is behind the `simulation`
 feature, so the release binary ships none of it. The sim draws standalone fee-rates
 from a bounded power-law distribution (a realistic "wall at the relay floor");
 `--fee-skew 1` restores the old uniform draw.
@@ -585,6 +587,8 @@ Tuning the fake node (restart `sim-serve` to change):
         --profile remote \       # throttled provider (rate-limited, ~150ms) vs `local`
         --size 20000 \           # initial mempool size
         --arrivals 600 --evictions 600 \   # churn per 2s tick
+        --cpfp-fraction 0.3 \    # fraction of arrivals that attach as a CPFP child (0 = no packages)
+        --max-chain 3 \          # max linear package/chain length (1 = no chaining)
         --block-secs 30 \        # seconds between blocks (0 = never mine)
         --reload-every 5 \       # simulate a node restart every 5 blocks (0 = off)
         --fee-skew 3             # fee-rate shape: 1 = uniform, higher = more txs near the relay floor
@@ -596,6 +600,10 @@ What to look for while `just watch` runs:
   (`just simulate`) stays caught up.
 - `/fees` populates within a few ticks; tiers are monotone (higher confirmation
   target ⇒ lower fee) and dip on each mined block, then recover as churn refills.
+  With the default skewed distribution the tiers spread apart (realistic demand)
+  rather than clustering near the cap.
+- CPFP: a low-fee parent is pulled into an earlier projected block by its
+  high-fee child — the estimator's ancestor-package path, exercised end-to-end.
 - `--reload-every N` → the mempool collapses and `caught_up` briefly drops, then
   the sync loop resyncs and settles (mass-drop + cooldown path).
 
