@@ -11,10 +11,9 @@ fn churn(arrivals: usize, evictions: usize) -> ChurnConfig {
     ChurnConfig {
         arrivals_per_tick: arrivals,
         evictions_per_tick: evictions,
-        fee: FeeDistribution {
-            min_sat_vb: 1,
-            max_sat_vb: 500,
-        },
+        fee: FeeDistribution::uniform(1, 500),
+        cpfp_fraction: 0.0,
+        max_chain: 1,
     }
 }
 
@@ -344,5 +343,58 @@ async fn steady_tick_mass_drop_resyncs_when_cooldown_expired() {
     assert!(
         read_state(&state).caught_up,
         "a successful bulk resync must report caught up"
+    );
+}
+
+#[tokio::test]
+async fn mocknode_packages_lift_a_parent_through_the_estimator() {
+    use crate::rpc::MempoolRpc;
+    use crate::sim::{ChurnConfig, FeeDistribution, MockNode};
+    // Dense packages: every eligible arrival attaches as a high-fee child.
+    let node = MockNode::new(
+        2024,
+        400,
+        ChurnConfig {
+            arrivals_per_tick: 0,
+            evictions_per_tick: 0,
+            fee: FeeDistribution::uniform(1, 100),
+            cpfp_fraction: 1.0,
+            max_chain: 3,
+        },
+    );
+    // Build the snapshot the estimator consumes: (txid, fee_sats, weight, depends).
+    let snap: Vec<(bitcoin::Txid, u64, u32, Vec<bitcoin::Txid>)> = node
+        .raw_mempool_verbose()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(txid, e)| {
+            (
+                txid,
+                e.fees.base.to_sat(),
+                e.weight.unwrap_or(e.vsize * 4) as u32,
+                e.depends.clone(),
+            )
+        })
+        .collect();
+
+    let gbt_txs = crate::fees::snapshot_to_gbt(&snap);
+    let proj = crate::gbt::project(gbt_txs);
+
+    // Some in-set parent (a tx another tx depends on) must be lifted above its
+    // own solo rate by its CPFP child.
+    let lifted = snap.iter().enumerate().any(|(i, (t, fee, weight, _))| {
+        let is_parent = snap.iter().any(|(_, _, _, d)| d.contains(t));
+        if !is_parent {
+            return false;
+        }
+        let own = 4.0 * *fee as f64 / *weight as f64;
+        proj.effective_rates
+            .get(&(i as u32))
+            .is_some_and(|&eff| eff > own + 1e-9)
+    });
+    assert!(
+        lifted,
+        "MockNode CPFP packages must lift at least one parent through the estimator"
     );
 }

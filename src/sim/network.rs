@@ -18,7 +18,12 @@ pub struct NetworkProfile {
 impl NetworkProfile {
     /// Local node: effectively instant, no limits.
     pub fn local_node() -> Self {
-        Self { latency: Duration::ZERO, req_per_sec: None, body_cap: None, drop_rate: 0.0 }
+        Self {
+            latency: Duration::ZERO,
+            req_per_sec: None,
+            body_cap: None,
+            drop_rate: 0.0,
+        }
     }
     /// Throttled remote provider (the GetBlock profile that produced the
     /// observed backlog): ~150ms latency, 20 req/sec, generous body cap.
@@ -41,7 +46,10 @@ pub(crate) struct Limiter {
 
 impl Limiter {
     pub(crate) fn new() -> Self {
-        Self { window_start: Instant::now(), count: 0 }
+        Self {
+            window_start: Instant::now(),
+            count: 0,
+        }
     }
 }
 
@@ -174,7 +182,9 @@ mod tests {
             ChurnConfig {
                 arrivals_per_tick: 0,
                 evictions_per_tick: 0,
-                fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 10 },
+                fee: FeeDistribution::uniform(1, 10),
+                cpfp_fraction: 0.0,
+                max_chain: 1,
             },
         )
     }

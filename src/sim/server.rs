@@ -49,6 +49,8 @@ pub async fn spawn(
     node: MockNode,
     profile: NetworkProfile,
     port: u16,
+    block_secs: u64,
+    reload_every: u32,
 ) -> anyhow::Result<SocketAddr> {
     use anyhow::Context;
 
@@ -76,17 +78,60 @@ pub async fn spawn(
     });
 
     // Keep the mempool alive: advance churn on a fixed tick so a client
-    // watching the live server sees arrivals/evictions over time.
+    // watching the live server sees arrivals/evictions over time. On a
+    // configurable cadence, also mine a block (confirm top-fee txs, advance
+    // the tip) and — every `reload_every` blocks — simulate a node restart
+    // (mass-drop + loaded:false) so the indexer's resync path is exercised live.
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        const CHURN_SECS: u64 = 2;
+        let tpb = ticks_per_block(block_secs, CHURN_SECS);
+        let mut interval = tokio::time::interval(Duration::from_secs(CHURN_SECS));
+        interval.tick().await; // consume the immediate first tick so the first advance() is a full period in
+        let mut tick: u64 = 0;
+        let mut blocks: u32 = 0;
         loop {
             interval.tick().await;
+            tick += 1;
             let mut n = state.node.lock().unwrap();
             n.advance();
+            if tpb != 0 && tick.is_multiple_of(tpb) {
+                let before = n.len();
+                n.mine_block();
+                blocks += 1;
+                tracing::info!(
+                    tip = n.tip_height_sync(),
+                    confirmed = before.saturating_sub(n.len()),
+                    mempool = n.len(),
+                    "sim: mined block"
+                );
+                if reload_every != 0 && blocks.is_multiple_of(reload_every) {
+                    // Node-restart disruption: drop most of the mempool and
+                    // report loaded:false for the next poll.
+                    n.mass_drop(0.8);
+                    n.reload();
+                    tracing::warn!(
+                        mempool = n.len(),
+                        "sim: node reload — mempool mass-dropped, reporting loaded=false for one poll"
+                    );
+                }
+            } else if tick.is_multiple_of(10) {
+                tracing::debug!(mempool = n.len(), tip = n.tip_height_sync(), "sim: churn");
+            }
         }
     });
 
     Ok(addr)
+}
+
+/// How many `churn_secs`-length churn ticks elapse between simulated blocks.
+/// `block_secs == 0` disables mining (returns 0). Otherwise the result is
+/// floored at 1 so a sub-tick block interval mines every tick rather than never.
+fn ticks_per_block(block_secs: u64, churn_secs: u64) -> u64 {
+    if block_secs == 0 {
+        0
+    } else {
+        (block_secs / churn_secs.max(1)).max(1)
+    }
 }
 
 async fn handle_rpc(
@@ -124,10 +169,16 @@ async fn dispatch(state: &ServerState, method: &str, params: &[Value]) -> Respon
             };
             ok_response(json!({ "chain": "main", "blocks": tip_height }))
         }
-        "getmempoolinfo" => ok_response(json!({
-            "loaded": true,
-            "mempoolminfee": 0.00001,
-        })),
+        "getmempoolinfo" => {
+            let loaded = {
+                let n = state.node.lock().unwrap();
+                n.loaded_sync()
+            };
+            ok_response(json!({
+                "loaded": loaded,
+                "mempoolminfee": 0.00001,
+            }))
+        }
         "getrawmempool" => {
             let verbose = params.first().and_then(Value::as_bool).unwrap_or(false);
             let entries = {
@@ -141,7 +192,10 @@ async fn dispatch(state: &ServerState, method: &str, params: &[Value]) -> Respon
                     .collect();
                 ok_response(Value::Object(map))
             } else {
-                let txids: Vec<String> = entries.into_iter().map(|(txid, _)| txid.to_string()).collect();
+                let txids: Vec<String> = entries
+                    .into_iter()
+                    .map(|(txid, _)| txid.to_string())
+                    .collect();
                 ok_response(json!(txids))
             }
         }
@@ -181,7 +235,7 @@ fn verbose_entry_json(e: &crate::rpc::MempoolEntry) -> Value {
     json!({
         "vsize": e.vsize,
         "weight": e.weight,
-        "depends": Vec::<String>::new(),
+        "depends": e.depends.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
         "fees": {
             "base": e.fees.base.to_btc(),
             "ancestor": e.fees.ancestor.to_btc(),
@@ -209,6 +263,23 @@ struct SimServeArgs {
     /// remote = getblock_remote profile; anything else = local_node.
     #[arg(long, default_value = "remote")]
     profile: String,
+    /// Seconds between simulated blocks (confirm top-fee txs, advance tip).
+    /// 0 = never mine (mempool churns only).
+    #[arg(long, default_value_t = 30)]
+    block_secs: u64,
+    /// Simulate a node restart (mass-drop + loaded:false) every N blocks.
+    /// 0 = never.
+    #[arg(long, default_value_t = 0)]
+    reload_every: u32,
+    /// Fraction of arrivals that attach as a CPFP child (0 = no packages).
+    #[arg(long, default_value_t = 0.15)]
+    cpfp_fraction: f64,
+    /// Max linear chain length (1 = no chaining).
+    #[arg(long, default_value_t = 3)]
+    max_chain: usize,
+    /// Fee-rate skew exponent: 1.0 = uniform, > 1.0 piles txs near the relay floor.
+    #[arg(long, default_value_t = 3.0)]
+    fee_skew: f64,
 }
 
 /// Entry point for `main.rs`'s `sim-serve` guard: parses the sim flags,
@@ -223,10 +294,52 @@ pub async fn run_cli() -> anyhow::Result<()> {
     let args = std::iter::once("sim-serve".to_string()).chain(rest);
     let args = SimServeArgs::parse_from(args);
 
+    let cpfp_fraction = if args.cpfp_fraction.is_nan() {
+        tracing::warn!(
+            value = args.cpfp_fraction,
+            "cpfp_fraction is NaN; clamping to 0.0"
+        );
+        0.0
+    } else {
+        let clamped = args.cpfp_fraction.clamp(0.0, 1.0);
+        if clamped != args.cpfp_fraction {
+            tracing::warn!(
+                value = args.cpfp_fraction,
+                clamped,
+                "cpfp_fraction out of [0.0, 1.0]; clamping"
+            );
+        }
+        clamped
+    };
+    let max_chain = args.max_chain.max(1);
+    if max_chain != args.max_chain {
+        tracing::warn!(
+            value = args.max_chain,
+            max_chain,
+            "max_chain below 1; flooring"
+        );
+    }
+
+    // NaN -> default; floor at a small positive so k stays > 0.
+    let fee_skew = if args.fee_skew.is_nan() {
+        tracing::warn!("--fee-skew was NaN; using default 3.0");
+        3.0
+    } else if args.fee_skew < 0.1 {
+        tracing::warn!(
+            requested = args.fee_skew,
+            "--fee-skew below 0.1; flooring to 0.1"
+        );
+        0.1
+    } else {
+        args.fee_skew
+    };
+
     let churn = ChurnConfig {
         arrivals_per_tick: args.arrivals,
         evictions_per_tick: args.evictions,
-        fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 500 },
+        fee: FeeDistribution::skewed(1, 500, fee_skew),
+        cpfp_fraction,
+        max_chain,
     };
     let node = MockNode::new(0, args.size, churn);
     let profile = if args.profile == "remote" {
@@ -235,9 +348,25 @@ pub async fn run_cli() -> anyhow::Result<()> {
         NetworkProfile::local_node()
     };
 
-    let addr = spawn(node, profile, args.port).await?;
+    let addr = spawn(node, profile, args.port, args.block_secs, args.reload_every).await?;
     tracing::info!(%addr, "sim node serving; point BTC_RPC_URL at it");
     std::future::pending::<anyhow::Result<()>>().await
+}
+
+#[cfg(test)]
+mod cadence_tests {
+    use super::ticks_per_block;
+
+    #[test]
+    fn ticks_per_block_maps_interval_to_churn_ticks() {
+        // 0 disables mining entirely.
+        assert_eq!(ticks_per_block(0, 2), 0);
+        // 30s blocks over 2s churn ticks => mine every 15 ticks.
+        assert_eq!(ticks_per_block(30, 2), 15);
+        // Sub-tick intervals floor at 1 (mine every tick) rather than never.
+        assert_eq!(ticks_per_block(1, 2), 1);
+        assert_eq!(ticks_per_block(2, 2), 1);
+    }
 }
 
 #[cfg(test)]
