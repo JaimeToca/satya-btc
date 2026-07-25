@@ -6,7 +6,8 @@ use rand::{Rng, SeedableRng};
 
 use crate::rpc::{MempoolEntry, MempoolEntryFees, MempoolInfo, MempoolRpc, RpcError};
 
-/// Inclusive sat/vB range synthetic fees are drawn from (uniform).
+/// Inclusive sat/vB range synthetic fees are drawn from, with a power-law `skew`
+/// controlling the shape (1.0 = uniform; > 1.0 piles draws near the floor).
 #[derive(Clone, Copy)]
 pub struct FeeDistribution {
     pub min_sat_vb: u64,
