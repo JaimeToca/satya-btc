@@ -179,7 +179,10 @@ async fn dispatch(state: &ServerState, method: &str, params: &[Value]) -> Respon
                     .collect();
                 ok_response(Value::Object(map))
             } else {
-                let txids: Vec<String> = entries.into_iter().map(|(txid, _)| txid.to_string()).collect();
+                let txids: Vec<String> = entries
+                    .into_iter()
+                    .map(|(txid, _)| txid.to_string())
+                    .collect();
                 ok_response(json!(txids))
             }
         }
@@ -275,12 +278,41 @@ pub async fn run_cli() -> anyhow::Result<()> {
     let args = std::iter::once("sim-serve".to_string()).chain(rest);
     let args = SimServeArgs::parse_from(args);
 
+    let cpfp_fraction = if args.cpfp_fraction.is_nan() {
+        tracing::warn!(
+            value = args.cpfp_fraction,
+            "cpfp_fraction is NaN; clamping to 0.0"
+        );
+        0.0
+    } else {
+        let clamped = args.cpfp_fraction.clamp(0.0, 1.0);
+        if clamped != args.cpfp_fraction {
+            tracing::warn!(
+                value = args.cpfp_fraction,
+                clamped,
+                "cpfp_fraction out of [0.0, 1.0]; clamping"
+            );
+        }
+        clamped
+    };
+    let max_chain = args.max_chain.max(1);
+    if max_chain != args.max_chain {
+        tracing::warn!(
+            value = args.max_chain,
+            max_chain,
+            "max_chain below 1; flooring"
+        );
+    }
+
     let churn = ChurnConfig {
         arrivals_per_tick: args.arrivals,
         evictions_per_tick: args.evictions,
-        fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 500 },
-        cpfp_fraction: args.cpfp_fraction,
-        max_chain: args.max_chain,
+        fee: FeeDistribution {
+            min_sat_vb: 1,
+            max_sat_vb: 500,
+        },
+        cpfp_fraction,
+        max_chain,
     };
     let node = MockNode::new(0, args.size, churn);
     let profile = if args.profile == "remote" {

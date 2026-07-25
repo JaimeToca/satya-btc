@@ -351,8 +351,8 @@ async fn steady_tick_mass_drop_resyncs_when_cooldown_expired() {
 
 #[tokio::test]
 async fn mocknode_packages_lift_a_parent_through_the_estimator() {
-    use crate::sim::{ChurnConfig, FeeDistribution, MockNode};
     use crate::rpc::MempoolRpc;
+    use crate::sim::{ChurnConfig, FeeDistribution, MockNode};
     // Dense packages: every eligible arrival attaches as a high-fee child.
     let node = MockNode::new(
         2024,
@@ -360,7 +360,10 @@ async fn mocknode_packages_lift_a_parent_through_the_estimator() {
         ChurnConfig {
             arrivals_per_tick: 0,
             evictions_per_tick: 0,
-            fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 100 },
+            fee: FeeDistribution {
+                min_sat_vb: 1,
+                max_sat_vb: 100,
+            },
             cpfp_fraction: 1.0,
             max_chain: 3,
         },

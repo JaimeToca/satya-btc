@@ -12,7 +12,10 @@ mod tests {
             ChurnConfig {
                 arrivals_per_tick: 0,
                 evictions_per_tick: 0,
-                fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 50 },
+                fee: FeeDistribution {
+                    min_sat_vb: 1,
+                    max_sat_vb: 50,
+                },
                 cpfp_fraction: 0.0,
                 max_chain: 1,
             },
@@ -40,7 +43,10 @@ mod tests {
 
     #[tokio::test]
     async fn real_client_sees_429_from_throttled_server() {
-        let profile = NetworkProfile { req_per_sec: Some(1), ..NetworkProfile::local_node() };
+        let profile = NetworkProfile {
+            req_per_sec: Some(1),
+            ..NetworkProfile::local_node()
+        };
         let addr = server::spawn(node(10), profile, 0, 0, 0).await.unwrap();
         let rpc = client(addr);
         let _ = rpc.tip_height().await; // consumes the 1/sec budget
@@ -61,7 +67,11 @@ mod tests {
         // The churn timer's first advance() is now one full period (2s) out, so
         // a millisecond-scale localhost roundtrip reliably observes the reload.
         let info = rpc.mempool_info().await.unwrap();
-        assert_eq!(info.loaded, Some(false), "reload must surface loaded:false over HTTP");
+        assert_eq!(
+            info.loaded,
+            Some(false),
+            "reload must surface loaded:false over HTTP"
+        );
     }
 
     #[tokio::test]
@@ -74,7 +84,10 @@ mod tests {
             ChurnConfig {
                 arrivals_per_tick: 0,
                 evictions_per_tick: 0,
-                fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 100 },
+                fee: FeeDistribution {
+                    min_sat_vb: 1,
+                    max_sat_vb: 100,
+                },
                 cpfp_fraction: 1.0,
                 max_chain: 3,
             },

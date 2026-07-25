@@ -43,11 +43,7 @@ pub struct MockNode {
 impl Clone for MockNode {
     fn clone(&self) -> Self {
         Self {
-            txs: self
-                .txs
-                .iter()
-                .map(|(k, v)| (*k, clone_entry(v)))
-                .collect(),
+            txs: self.txs.iter().map(|(k, v)| (*k, clone_entry(v))).collect(),
             children: self.children.clone(),
             tip_height: self.tip_height,
             min_fee: self.min_fee,
@@ -262,7 +258,11 @@ impl MockNode {
         let vsize: u64 = self.rng.gen_range(110..=100_000);
         let weight = vsize * 4;
         let base = Amount::from_sat(sat_vb.saturating_mul(vsize));
-        let fees = MempoolEntryFees { base, ancestor: base, descendant: base };
+        let fees = MempoolEntryFees {
+            base,
+            ancestor: base,
+            descendant: base,
+        };
         let entry = MempoolEntry {
             vsize,
             weight: Some(weight),
@@ -303,6 +303,8 @@ impl MockNode {
         if self.cfg.max_chain < 2 {
             return None;
         }
+        // O(n) per arrival by design: sim mempools are 10^2-10^4 txs (not
+        // production-scale); do not hoist into a hot path.
         let keys: Vec<Txid> = self.txs.keys().copied().collect();
         let eligible: Vec<Txid> = keys
             .into_iter()
@@ -328,6 +330,25 @@ impl MockNode {
         best.map(|(_, t)| t)
     }
 
+    /// Adjust the descendant aggregates of `from` and every ancestor above it by one
+    /// tx of `vsize`/`base`. `add == true` bumps (a child attached); `false` subtracts
+    /// (a leaf removed), saturating/checked to avoid underflow if aggregates ever drift.
+    fn adjust_descendant_totals(&mut self, from: Txid, vsize: u64, base: Amount, add: bool) {
+        let mut chain = vec![from];
+        chain.extend(self.ancestors_of(&from));
+        for a in chain {
+            if let Some(e) = self.txs.get_mut(&a) {
+                if add {
+                    e.descendantsize += vsize;
+                    e.fees.descendant += base;
+                } else {
+                    e.descendantsize = e.descendantsize.saturating_sub(vsize);
+                    e.fees.descendant = e.fees.descendant.checked_sub(base).unwrap_or(Amount::ZERO);
+                }
+            }
+        }
+    }
+
     /// Attach a fresh high-fee child to `parent`, extending a linear CPFP chain and
     /// keeping all ancestor/descendant aggregates truthful.
     fn attach_child(&mut self, parent: Txid) {
@@ -344,14 +365,7 @@ impl MockNode {
         self.txs.insert(txid, entry);
         self.children.insert(parent, txid);
         // Bump descendant aggregates on the parent AND every ancestor above it.
-        let mut chain = vec![parent];
-        chain.extend(self.ancestors_of(&parent));
-        for a in chain {
-            if let Some(e) = self.txs.get_mut(&a) {
-                e.descendantsize += child_vsize;
-                e.fees.descendant += child_base;
-            }
-        }
+        self.adjust_descendant_totals(parent, child_vsize, child_base, true);
     }
 
     /// Remove a leaf tx (one with no in-mempool child), keeping the children index
@@ -369,22 +383,14 @@ impl MockNode {
         if let Some(parent) = entry.depends.first().copied() {
             self.children.remove(&parent);
             // Subtract this leaf from the parent AND every ancestor above it.
-            let mut chain = vec![parent];
-            chain.extend(self.ancestors_of(&parent));
-            for a in chain {
-                if let Some(e) = self.txs.get_mut(&a) {
-                    e.descendantsize = e.descendantsize.saturating_sub(vsize);
-                    e.fees.descendant = e.fees.descendant.checked_sub(base).unwrap_or(Amount::ZERO);
-                }
-            }
+            self.adjust_descendant_totals(parent, vsize, base, false);
         }
     }
 
     /// One arrival: attach a CPFP child with probability `cpfp_fraction` when an
     /// eligible parent exists; otherwise insert a standalone tx.
     fn add_arrival(&mut self) {
-        let attach = self.cfg.cpfp_fraction > 0.0
-            && self.rng.gen::<f64>() < self.cfg.cpfp_fraction;
+        let attach = self.cfg.cpfp_fraction > 0.0 && self.rng.gen::<f64>() < self.cfg.cpfp_fraction;
         if attach {
             if let Some(parent) = self.pick_parent() {
                 self.attach_child(parent);
@@ -415,11 +421,7 @@ impl MempoolRpc for MockNode {
         Ok(self.txs.keys().copied().collect())
     }
     async fn raw_mempool_verbose(&self) -> Result<Vec<(Txid, MempoolEntry)>, RpcError> {
-        Ok(self
-            .txs
-            .iter()
-            .map(|(k, v)| (*k, clone_entry(v)))
-            .collect())
+        Ok(self.txs.iter().map(|(k, v)| (*k, clone_entry(v))).collect())
     }
     async fn mempool_entry(&self, txid: &Txid) -> Result<Option<MempoolEntry>, RpcError> {
         Ok(self.txs.get(txid).map(clone_entry))
@@ -459,7 +461,10 @@ mod tests {
         ChurnConfig {
             arrivals_per_tick: 50,
             evictions_per_tick: 40,
-            fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 500 },
+            fee: FeeDistribution {
+                min_sat_vb: 1,
+                max_sat_vb: 500,
+            },
             cpfp_fraction: 0.0,
             max_chain: 1,
         }
@@ -469,7 +474,10 @@ mod tests {
         ChurnConfig {
             arrivals_per_tick: 0,
             evictions_per_tick: 0,
-            fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 100 },
+            fee: FeeDistribution {
+                min_sat_vb: 1,
+                max_sat_vb: 100,
+            },
             cpfp_fraction: 1.0, // every arrival that can attach, does
             max_chain: 3,
         }
@@ -493,7 +501,10 @@ mod tests {
                 assert_eq!(node.child_of(&parent), Some(txid));
             }
         }
-        assert!(saw_package, "cpfp_fraction=1.0 must produce at least one package");
+        assert!(
+            saw_package,
+            "cpfp_fraction=1.0 must produce at least one package"
+        );
     }
 
     #[tokio::test]
@@ -544,7 +555,10 @@ mod tests {
         let n = MockNode::new(3, 500, cfg());
         for (_txid, e) in n.raw_mempool_verbose().await.unwrap() {
             let sat_vb = e.fees.base.to_sat() / e.vsize.max(1);
-            assert!((1..=500).contains(&sat_vb), "fee {sat_vb} sat/vB out of range");
+            assert!(
+                (1..=500).contains(&sat_vb),
+                "fee {sat_vb} sat/vB out of range"
+            );
         }
     }
 
@@ -553,7 +567,10 @@ mod tests {
         let cfg = ChurnConfig {
             arrivals_per_tick: 40,
             evictions_per_tick: 40,
-            fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 100 },
+            fee: FeeDistribution {
+                min_sat_vb: 1,
+                max_sat_vb: 100,
+            },
             cpfp_fraction: 0.5,
             max_chain: 3,
         };
@@ -575,9 +592,14 @@ mod tests {
     #[tokio::test]
     async fn mass_drop_never_orphans_and_shrinks() {
         let cfg = ChurnConfig {
-            arrivals_per_tick: 0, evictions_per_tick: 0,
-            fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 100 },
-            cpfp_fraction: 0.5, max_chain: 3,
+            arrivals_per_tick: 0,
+            evictions_per_tick: 0,
+            fee: FeeDistribution {
+                min_sat_vb: 1,
+                max_sat_vb: 100,
+            },
+            cpfp_fraction: 0.5,
+            max_chain: 3,
         };
         let mut node = MockNode::new(42, 400, cfg);
         let before = node.len();
@@ -585,7 +607,10 @@ mod tests {
         assert!(node.len() < before, "mass_drop must shrink the mempool");
         for (_txid, e) in node.raw_mempool_verbose().await.unwrap() {
             if let Some(parent) = e.depends.first() {
-                assert!(node.entry_by_txid(parent).is_some(), "mass_drop orphaned a child");
+                assert!(
+                    node.entry_by_txid(parent).is_some(),
+                    "mass_drop orphaned a child"
+                );
             }
         }
     }
@@ -596,7 +621,10 @@ mod tests {
         let cfg = ChurnConfig {
             arrivals_per_tick: 0,
             evictions_per_tick: 0,
-            fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 500 },
+            fee: FeeDistribution {
+                min_sat_vb: 1,
+                max_sat_vb: 500,
+            },
             cpfp_fraction: 0.0,
             max_chain: 1,
         };
@@ -632,7 +660,10 @@ mod tests {
             .map(|(_id, e)| e.fees.base.to_sat() / e.vsize.max(1))
             .min()
             .unwrap();
-        assert_eq!(min_rate_after, min_rate_before, "lowest-fee tx must survive");
+        assert_eq!(
+            min_rate_after, min_rate_before,
+            "lowest-fee tx must survive"
+        );
     }
 
     #[tokio::test]
@@ -672,7 +703,10 @@ mod tests {
 
         // b was re-rooted: depends cleared, ancestor aggregates equal its own.
         let b_after = node.entry_by_txid(&b).expect("b must survive");
-        assert!(b_after.depends.is_empty(), "b must be re-rooted (depends cleared)");
+        assert!(
+            b_after.depends.is_empty(),
+            "b must be re-rooted (depends cleared)"
+        );
         assert_eq!(b_after.ancestorsize, b_after.vsize);
         assert_eq!(b_after.fees.ancestor, b_after.fees.base);
 
@@ -697,7 +731,10 @@ mod tests {
         let cfg = ChurnConfig {
             arrivals_per_tick: 60,
             evictions_per_tick: 20,
-            fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 100 },
+            fee: FeeDistribution {
+                min_sat_vb: 1,
+                max_sat_vb: 100,
+            },
             cpfp_fraction: 0.6,
             max_chain: 3,
         };
@@ -723,7 +760,10 @@ mod tests {
                         "fees.ancestor drift for {txid:?}"
                     );
                 } else {
-                    assert_eq!(e.ancestorsize, e.vsize, "root ancestorsize drift for {txid:?}");
+                    assert_eq!(
+                        e.ancestorsize, e.vsize,
+                        "root ancestorsize drift for {txid:?}"
+                    );
                     assert_eq!(
                         e.fees.ancestor, e.fees.base,
                         "root fees.ancestor drift for {txid:?}"
@@ -770,7 +810,10 @@ mod tests {
         let cfg = ChurnConfig {
             arrivals_per_tick: 0,
             evictions_per_tick: 0,
-            fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 100 },
+            fee: FeeDistribution {
+                min_sat_vb: 1,
+                max_sat_vb: 100,
+            },
             cpfp_fraction: 1.0,
             max_chain: 3,
         };
