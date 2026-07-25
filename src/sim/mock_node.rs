@@ -11,6 +11,28 @@ use crate::rpc::{MempoolEntry, MempoolEntryFees, MempoolInfo, MempoolRpc, RpcErr
 pub struct FeeDistribution {
     pub min_sat_vb: u64,
     pub max_sat_vb: u64,
+    /// Power-law skew exponent for the fee-rate draw. 1.0 = uniform; > 1.0 biases
+    /// draws toward the floor (the realistic "wall at the relay floor").
+    pub skew: f64,
+}
+
+impl FeeDistribution {
+    /// Uniform fee-rates over [min, max] (skew = 1.0) — the pre-skew behaviour.
+    pub fn uniform(min_sat_vb: u64, max_sat_vb: u64) -> Self {
+        Self {
+            min_sat_vb,
+            max_sat_vb,
+            skew: 1.0,
+        }
+    }
+    /// Power-law-skewed fee-rates over [min, max]. `skew > 1.0` piles draws near the floor.
+    pub fn skewed(min_sat_vb: u64, max_sat_vb: u64, skew: f64) -> Self {
+        Self {
+            min_sat_vb,
+            max_sat_vb,
+            skew,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -397,11 +419,27 @@ impl MockNode {
                 return;
             }
         }
-        let sat_vb = self
-            .rng
-            .gen_range(self.cfg.fee.min_sat_vb..=self.cfg.fee.max_sat_vb);
+        let sat_vb = self.sample_fee_rate();
         let (txid, entry) = self.gen_standalone_entry(sat_vb);
         self.txs.insert(txid, entry);
+    }
+
+    /// Draw a standalone tx's fee-rate (sat/vB) from a bounded power-law over
+    /// `[min, max]`: `rate = min + (max - min) * u^skew`. `skew == 1.0` is uniform;
+    /// `skew > 1.0` piles draws near the floor. All randomness from the seeded rng.
+    fn sample_fee_rate(&mut self) -> u64 {
+        let FeeDistribution {
+            min_sat_vb: min,
+            max_sat_vb: max,
+            skew,
+        } = self.cfg.fee;
+        if max <= min {
+            return min;
+        }
+        let u: f64 = self.rng.gen(); // [0, 1)
+        let span = (max - min) as f64;
+        let rate = min + (span * u.powf(skew)).round() as u64;
+        rate.min(max)
     }
 }
 
@@ -461,10 +499,7 @@ mod tests {
         ChurnConfig {
             arrivals_per_tick: 50,
             evictions_per_tick: 40,
-            fee: FeeDistribution {
-                min_sat_vb: 1,
-                max_sat_vb: 500,
-            },
+            fee: FeeDistribution::uniform(1, 500),
             cpfp_fraction: 0.0,
             max_chain: 1,
         }
@@ -474,10 +509,7 @@ mod tests {
         ChurnConfig {
             arrivals_per_tick: 0,
             evictions_per_tick: 0,
-            fee: FeeDistribution {
-                min_sat_vb: 1,
-                max_sat_vb: 100,
-            },
+            fee: FeeDistribution::uniform(1, 100),
             cpfp_fraction: 1.0, // every arrival that can attach, does
             max_chain: 3,
         }
@@ -567,10 +599,7 @@ mod tests {
         let cfg = ChurnConfig {
             arrivals_per_tick: 40,
             evictions_per_tick: 40,
-            fee: FeeDistribution {
-                min_sat_vb: 1,
-                max_sat_vb: 100,
-            },
+            fee: FeeDistribution::uniform(1, 100),
             cpfp_fraction: 0.5,
             max_chain: 3,
         };
@@ -594,10 +623,7 @@ mod tests {
         let cfg = ChurnConfig {
             arrivals_per_tick: 0,
             evictions_per_tick: 0,
-            fee: FeeDistribution {
-                min_sat_vb: 1,
-                max_sat_vb: 100,
-            },
+            fee: FeeDistribution::uniform(1, 100),
             cpfp_fraction: 0.5,
             max_chain: 3,
         };
@@ -621,10 +647,7 @@ mod tests {
         let cfg = ChurnConfig {
             arrivals_per_tick: 0,
             evictions_per_tick: 0,
-            fee: FeeDistribution {
-                min_sat_vb: 1,
-                max_sat_vb: 500,
-            },
+            fee: FeeDistribution::uniform(1, 500),
             cpfp_fraction: 0.0,
             max_chain: 1,
         };
@@ -731,10 +754,7 @@ mod tests {
         let cfg = ChurnConfig {
             arrivals_per_tick: 60,
             evictions_per_tick: 20,
-            fee: FeeDistribution {
-                min_sat_vb: 1,
-                max_sat_vb: 100,
-            },
+            fee: FeeDistribution::uniform(1, 100),
             cpfp_fraction: 0.6,
             max_chain: 3,
         };
@@ -805,15 +825,66 @@ mod tests {
         assert_invariant(&node);
     }
 
+    #[test]
+    fn skewed_fees_pile_near_the_floor() {
+        // skew = 3 over [1, 1000]: most draws land in the bottom quarter (<=250).
+        let cfg = ChurnConfig {
+            arrivals_per_tick: 0,
+            evictions_per_tick: 0,
+            fee: FeeDistribution::skewed(1, 1000, 3.0),
+            cpfp_fraction: 0.0,
+            max_chain: 1,
+        };
+        let mut node = MockNode::new(2024, 1, cfg);
+        let n = 5000;
+        let mut in_bottom_quarter = 0u32;
+        for _ in 0..n {
+            let r = node.sample_fee_rate();
+            assert!((1..=1000).contains(&r), "sample {r} out of [1,1000]");
+            if r <= 250 {
+                in_bottom_quarter += 1;
+            }
+        }
+        let frac = f64::from(in_bottom_quarter) / f64::from(n);
+        assert!(
+            frac > 0.55,
+            "skewed draw should pile low: {frac} in bottom quarter (uniform ~0.25)"
+        );
+    }
+
+    #[test]
+    fn uniform_skew_spreads_evenly() {
+        // skew = 1.0 (uniform) over [1, 1000]: ~25% in the bottom quarter.
+        let cfg = ChurnConfig {
+            arrivals_per_tick: 0,
+            evictions_per_tick: 0,
+            fee: FeeDistribution::uniform(1, 1000),
+            cpfp_fraction: 0.0,
+            max_chain: 1,
+        };
+        let mut node = MockNode::new(7, 1, cfg);
+        let n = 5000;
+        let mut in_bottom_quarter = 0u32;
+        for _ in 0..n {
+            let r = node.sample_fee_rate();
+            assert!((1..=1000).contains(&r), "sample {r} out of [1,1000]");
+            if r <= 250 {
+                in_bottom_quarter += 1;
+            }
+        }
+        let frac = f64::from(in_bottom_quarter) / f64::from(n);
+        assert!(
+            (0.15..0.35).contains(&frac),
+            "uniform draw should be ~0.25 in bottom quarter, got {frac}"
+        );
+    }
+
     #[tokio::test]
     async fn mine_block_confirms_whole_packages_and_never_orphans() {
         let cfg = ChurnConfig {
             arrivals_per_tick: 0,
             evictions_per_tick: 0,
-            fee: FeeDistribution {
-                min_sat_vb: 1,
-                max_sat_vb: 100,
-            },
+            fee: FeeDistribution::uniform(1, 100),
             cpfp_fraction: 1.0,
             max_chain: 3,
         };

@@ -12,10 +12,7 @@ mod tests {
             ChurnConfig {
                 arrivals_per_tick: 0,
                 evictions_per_tick: 0,
-                fee: FeeDistribution {
-                    min_sat_vb: 1,
-                    max_sat_vb: 50,
-                },
+                fee: FeeDistribution::uniform(1, 50),
                 cpfp_fraction: 0.0,
                 max_chain: 1,
             },
@@ -84,10 +81,7 @@ mod tests {
             ChurnConfig {
                 arrivals_per_tick: 0,
                 evictions_per_tick: 0,
-                fee: FeeDistribution {
-                    min_sat_vb: 1,
-                    max_sat_vb: 100,
-                },
+                fee: FeeDistribution::uniform(1, 100),
                 cpfp_fraction: 1.0,
                 max_chain: 3,
             },

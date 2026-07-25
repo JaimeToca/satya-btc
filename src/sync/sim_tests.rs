@@ -11,10 +11,7 @@ fn churn(arrivals: usize, evictions: usize) -> ChurnConfig {
     ChurnConfig {
         arrivals_per_tick: arrivals,
         evictions_per_tick: evictions,
-        fee: FeeDistribution {
-            min_sat_vb: 1,
-            max_sat_vb: 500,
-        },
+        fee: FeeDistribution::uniform(1, 500),
         cpfp_fraction: 0.0,
         max_chain: 1,
     }
@@ -360,10 +357,7 @@ async fn mocknode_packages_lift_a_parent_through_the_estimator() {
         ChurnConfig {
             arrivals_per_tick: 0,
             evictions_per_tick: 0,
-            fee: FeeDistribution {
-                min_sat_vb: 1,
-                max_sat_vb: 100,
-            },
+            fee: FeeDistribution::uniform(1, 100),
             cpfp_fraction: 1.0,
             max_chain: 3,
         },

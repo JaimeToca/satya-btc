@@ -320,10 +320,7 @@ pub async fn run_cli() -> anyhow::Result<()> {
     let churn = ChurnConfig {
         arrivals_per_tick: args.arrivals,
         evictions_per_tick: args.evictions,
-        fee: FeeDistribution {
-            min_sat_vb: 1,
-            max_sat_vb: 500,
-        },
+        fee: FeeDistribution::uniform(1, 500),
         cpfp_fraction,
         max_chain,
     };
