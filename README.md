@@ -10,6 +10,8 @@ copy of the mempool, synced directly from your node, and simulates the next few
 blocks the way a miner would to read fee tiers off that simulation. One static
 binary. No database, no Redis, no explorer.
 
+> ⚠️ **Status: active development.** Satya is pre-1.0 and evolving — the API (including `/fees` output), config flags, and behavior may change without notice. Not yet recommended for production reliance.
+
 ## Contents
 
 - [Why Satya exists](#why-satya-exists)
