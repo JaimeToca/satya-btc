@@ -555,7 +555,9 @@ You can exercise the entire indexer — the real `reqwest` client, sync loop, fe
 engine, and HTTP API — against an offline fake node, with no Bitcoin Core. The
 sim node churns a mempool, mines blocks (confirming top-fee txs and advancing
 the tip), and can simulate a node restart. Everything is behind the `simulation`
-feature, so the release binary ships none of it.
+feature, so the release binary ships none of it. The sim draws standalone fee-rates
+from a bounded power-law distribution (a realistic "wall at the relay floor");
+`--fee-skew 1` restores the old uniform draw.
 
 Three terminals:
 
@@ -584,7 +586,8 @@ Tuning the fake node (restart `sim-serve` to change):
         --size 20000 \           # initial mempool size
         --arrivals 600 --evictions 600 \   # churn per 2s tick
         --block-secs 30 \        # seconds between blocks (0 = never mine)
-        --reload-every 5         # simulate a node restart every 5 blocks (0 = off)
+        --reload-every 5 \       # simulate a node restart every 5 blocks (0 = off)
+        --fee-skew 3             # fee-rate shape: 1 = uniform, higher = more txs near the relay floor
 
 What to look for while `just watch` runs:
 

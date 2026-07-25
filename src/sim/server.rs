@@ -277,6 +277,9 @@ struct SimServeArgs {
     /// Max linear chain length (1 = no chaining).
     #[arg(long, default_value_t = 3)]
     max_chain: usize,
+    /// Fee-rate skew exponent: 1.0 = uniform, > 1.0 piles txs near the relay floor.
+    #[arg(long, default_value_t = 3.0)]
+    fee_skew: f64,
 }
 
 /// Entry point for `main.rs`'s `sim-serve` guard: parses the sim flags,
@@ -317,10 +320,17 @@ pub async fn run_cli() -> anyhow::Result<()> {
         );
     }
 
+    // NaN -> default; floor at a small positive so k stays > 0.
+    let fee_skew = if args.fee_skew.is_nan() {
+        3.0
+    } else {
+        args.fee_skew.max(0.1)
+    };
+
     let churn = ChurnConfig {
         arrivals_per_tick: args.arrivals,
         evictions_per_tick: args.evictions,
-        fee: FeeDistribution::uniform(1, 500),
+        fee: FeeDistribution::skewed(1, 500, fee_skew),
         cpfp_fraction,
         max_chain,
     };
