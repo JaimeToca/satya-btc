@@ -273,6 +273,8 @@ pub async fn run_cli() -> anyhow::Result<()> {
         arrivals_per_tick: args.arrivals,
         evictions_per_tick: args.evictions,
         fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 500 },
+        cpfp_fraction: 0.15,
+        max_chain: 3,
     };
     let node = MockNode::new(0, args.size, churn);
     let profile = if args.profile == "remote" {

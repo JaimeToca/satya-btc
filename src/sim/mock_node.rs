@@ -18,11 +18,17 @@ pub struct ChurnConfig {
     pub arrivals_per_tick: usize,
     pub evictions_per_tick: usize,
     pub fee: FeeDistribution,
+    /// Fraction of arrivals that attach as a CPFP child of an existing tx.
+    pub cpfp_fraction: f64,
+    /// Max linear chain length (root + descendants). 1 disables chaining.
+    pub max_chain: usize,
 }
 
 /// A deterministic, in-memory stand-in for a Bitcoin node's mempool RPC surface.
 pub struct MockNode {
     txs: HashMap<Txid, MempoolEntry>,
+    /// Reverse index: parent txid -> its single child (linear chains).
+    children: HashMap<Txid, Txid>,
     tip_height: u64,
     min_fee: Amount,
     /// When true, the NEXT `mempool_info` reports `loaded: Some(false)` then clears
@@ -42,6 +48,7 @@ impl Clone for MockNode {
                 .iter()
                 .map(|(k, v)| (*k, clone_entry(v)))
                 .collect(),
+            children: self.children.clone(),
             tip_height: self.tip_height,
             min_fee: self.min_fee,
             reloading: self.reloading,
@@ -55,6 +62,7 @@ impl MockNode {
     pub fn new(seed: u64, initial_size: usize, cfg: ChurnConfig) -> Self {
         let mut node = Self {
             txs: HashMap::with_capacity(initial_size),
+            children: HashMap::new(),
             tip_height: 800_000,
             min_fee: Amount::from_sat(1_000), // 1 sat/vB-ish floor in sats/kvB terms
             reloading: false,
@@ -62,8 +70,7 @@ impl MockNode {
             cfg,
         };
         for _ in 0..initial_size {
-            let (txid, entry) = node.gen_entry();
-            node.txs.insert(txid, entry);
+            node.add_arrival();
         }
         node
     }
@@ -77,8 +84,7 @@ impl MockNode {
             }
         }
         for _ in 0..self.cfg.arrivals_per_tick {
-            let (txid, entry) = self.gen_entry();
-            self.txs.insert(txid, entry);
+            self.add_arrival();
         }
     }
 
@@ -160,28 +166,17 @@ impl MockNode {
         self.txs.get(txid).map(clone_entry)
     }
 
-    /// Build one synthetic `(Txid, MempoolEntry)` with a fresh random txid and
-    /// internally-consistent size/fee/package fields.
-    fn gen_entry(&mut self) -> (Txid, MempoolEntry) {
+    /// A fresh standalone entry paying `sat_vb`; depends empty, ancestor/descendant
+    /// aggregates equal its own (a solo package).
+    fn gen_standalone_entry(&mut self, sat_vb: u64) -> (Txid, MempoolEntry) {
         use bitcoin::hashes::Hash;
         let mut raw = [0u8; 32];
         self.rng.fill(&mut raw);
         let txid = Txid::from_byte_array(raw);
-
         let vsize: u64 = self.rng.gen_range(110..=100_000);
         let weight = vsize * 4;
-        let sat_vb: u64 = self
-            .rng
-            .gen_range(self.cfg.fee.min_sat_vb..=self.cfg.fee.max_sat_vb);
         let base = Amount::from_sat(sat_vb.saturating_mul(vsize));
-
-        // Solo package (no ancestors/descendants) keeps the model simple but
-        // consistent: ancestor/descendant totals equal this tx's own.
-        let fees = MempoolEntryFees {
-            base,
-            ancestor: base,
-            descendant: base,
-        };
+        let fees = MempoolEntryFees { base, ancestor: base, descendant: base };
         let entry = MempoolEntry {
             vsize,
             weight: Some(weight),
@@ -189,12 +184,112 @@ impl MockNode {
             fees,
             ancestorsize: vsize,
             descendantsize: vsize,
-            // Fixed synthetic entry time; the sim doesn't model tx age, so a
-            // constant keeps snapshots deterministic.
             time: Some(1_700_000_000),
         };
         (txid, entry)
     }
+
+    /// In-mempool ancestors of `txid`, nearest parent first (linear chain).
+    fn ancestors_of(&self, txid: &Txid) -> Vec<Txid> {
+        let mut out = Vec::new();
+        let mut cur = *txid;
+        while let Some(entry) = self.txs.get(&cur) {
+            match entry.depends.first() {
+                Some(p) if self.txs.contains_key(p) => {
+                    out.push(*p);
+                    cur = *p;
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// Test/inspection accessor: the recorded child of `parent`, if any.
+    pub fn child_of(&self, parent: &Txid) -> Option<Txid> {
+        self.children.get(parent).copied()
+    }
+
+    /// An eligible parent to extend: a childless tx whose chain is shorter than
+    /// `max_chain`. Low-fee-biased (samples a few candidates, keeps the cheapest)
+    /// so CPFP children visibly lift cheap parents. Returns None if none exist.
+    fn pick_parent(&mut self) -> Option<Txid> {
+        if self.cfg.max_chain < 2 {
+            return None;
+        }
+        let keys: Vec<Txid> = self.txs.keys().copied().collect();
+        let eligible: Vec<Txid> = keys
+            .into_iter()
+            .filter(|t| {
+                !self.children.contains_key(t)
+                    && self.ancestors_of(t).len() + 1 < self.cfg.max_chain
+            })
+            .collect();
+        if eligible.is_empty() {
+            return None;
+        }
+        let samples = eligible.len().min(8);
+        let mut best: Option<(u64, Txid)> = None;
+        for _ in 0..samples {
+            let idx = self.rng.gen_range(0..eligible.len());
+            let t = eligible[idx];
+            let r = own_rate_sat_vb(&self.txs[&t]);
+            match best {
+                Some((br, bt)) if (br, bt) <= (r, t) => {}
+                _ => best = Some((r, t)),
+            }
+        }
+        best.map(|(_, t)| t)
+    }
+
+    /// Attach a fresh high-fee child to `parent`, extending a linear CPFP chain and
+    /// keeping all ancestor/descendant aggregates truthful.
+    fn attach_child(&mut self, parent: Txid) {
+        let child_rate = self.cfg.fee.max_sat_vb; // high fee -> package lift
+        let (txid, mut entry) = self.gen_standalone_entry(child_rate);
+        entry.depends = vec![parent];
+        {
+            let p = &self.txs[&parent];
+            entry.ancestorsize = entry.vsize + p.ancestorsize;
+            entry.fees.ancestor = entry.fees.base + p.fees.ancestor;
+        }
+        let child_vsize = entry.vsize;
+        let child_base = entry.fees.base;
+        self.txs.insert(txid, entry);
+        self.children.insert(parent, txid);
+        // Bump descendant aggregates on the parent AND every ancestor above it.
+        let mut chain = vec![parent];
+        chain.extend(self.ancestors_of(&parent));
+        for a in chain {
+            if let Some(e) = self.txs.get_mut(&a) {
+                e.descendantsize += child_vsize;
+                e.fees.descendant += child_base;
+            }
+        }
+    }
+
+    /// One arrival: attach a CPFP child with probability `cpfp_fraction` when an
+    /// eligible parent exists; otherwise insert a standalone tx.
+    fn add_arrival(&mut self) {
+        let attach = self.cfg.cpfp_fraction > 0.0
+            && self.rng.gen::<f64>() < self.cfg.cpfp_fraction;
+        if attach {
+            if let Some(parent) = self.pick_parent() {
+                self.attach_child(parent);
+                return;
+            }
+        }
+        let sat_vb = self
+            .rng
+            .gen_range(self.cfg.fee.min_sat_vb..=self.cfg.fee.max_sat_vb);
+        let (txid, entry) = self.gen_standalone_entry(sat_vb);
+        self.txs.insert(txid, entry);
+    }
+}
+
+/// Own fee-rate in sat/vB (integer), guarding zero vsize.
+fn own_rate_sat_vb(e: &MempoolEntry) -> u64 {
+    e.fees.base.to_sat() / e.vsize.max(1)
 }
 
 impl MempoolRpc for MockNode {
@@ -253,6 +348,52 @@ mod tests {
             arrivals_per_tick: 50,
             evictions_per_tick: 40,
             fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 500 },
+            cpfp_fraction: 0.0,
+            max_chain: 1,
+        }
+    }
+
+    fn cpfp_cfg() -> ChurnConfig {
+        ChurnConfig {
+            arrivals_per_tick: 0,
+            evictions_per_tick: 0,
+            fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 100 },
+            cpfp_fraction: 1.0, // every arrival that can attach, does
+            max_chain: 3,
+        }
+    }
+
+    #[tokio::test]
+    async fn packages_have_consistent_aggregates_and_present_parents() {
+        let node = MockNode::new(2024, 300, cpfp_cfg());
+        let mut saw_package = false;
+        for (txid, e) in node.raw_mempool_verbose().await.unwrap() {
+            if let Some(parent) = e.depends.first().copied() {
+                saw_package = true;
+                // Invariant: parent is present in the mempool.
+                let p = node
+                    .entry_by_txid(&parent)
+                    .expect("child's depends parent must be present");
+                // Child ancestor aggregates = own + parent's ancestor totals.
+                assert_eq!(e.ancestorsize, e.vsize + p.ancestorsize);
+                assert_eq!(e.fees.ancestor, e.fees.base + p.fees.ancestor);
+                // The parent must record this child.
+                assert_eq!(node.child_of(&parent), Some(txid));
+            }
+        }
+        assert!(saw_package, "cpfp_fraction=1.0 must produce at least one package");
+    }
+
+    #[tokio::test]
+    async fn parent_descendant_aggregates_match_child_subtree() {
+        let node = MockNode::new(7, 300, cpfp_cfg());
+        for (txid, p) in node.raw_mempool_verbose().await.unwrap() {
+            if let Some(child) = node.child_of(&txid) {
+                let c = node.entry_by_txid(&child).unwrap();
+                // Linear chain: parent's descendant totals = own + child's subtree.
+                assert_eq!(p.descendantsize, p.vsize + c.descendantsize);
+                assert_eq!(p.fees.descendant, p.fees.base + c.fees.descendant);
+            }
         }
     }
 
@@ -302,6 +443,8 @@ mod tests {
             arrivals_per_tick: 0,
             evictions_per_tick: 0,
             fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 500 },
+            cpfp_fraction: 0.0,
+            max_chain: 1,
         };
         let mut n = MockNode::new(99, 2000, cfg);
 

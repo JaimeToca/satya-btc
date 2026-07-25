@@ -15,6 +15,8 @@ fn churn(arrivals: usize, evictions: usize) -> ChurnConfig {
             min_sat_vb: 1,
             max_sat_vb: 500,
         },
+        cpfp_fraction: 0.0,
+        max_chain: 1,
     }
 }
 

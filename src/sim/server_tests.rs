@@ -13,6 +13,8 @@ mod tests {
                 arrivals_per_tick: 0,
                 evictions_per_tick: 0,
                 fee: FeeDistribution { min_sat_vb: 1, max_sat_vb: 50 },
+                cpfp_fraction: 0.0,
+                max_chain: 1,
             },
         )
     }
