@@ -34,13 +34,16 @@ setup() {
     echo "bitcoind already running (datadir: $DATADIR)"; return
   fi
   mkdir -p "$DATADIR"
+  # NOTE (Core v29+): network-specific options like `rpcport` must live under a
+  # `[signet]` section, not at the top level.
   cat > "$DATADIR/bitcoin.conf" <<EOF
 signet=1
 server=1
 prune=550
-rpcport=$RPC_PORT
 # blocksonly stays OFF (default) so the mempool relays -> real /fees
 # txindex NOT needed for mempool RPCs
+[signet]
+rpcport=$RPC_PORT
 EOF
   echo "starting pruned signet bitcoind (datadir: $DATADIR)..."
   bitcoind -datadir="$DATADIR" -daemon
