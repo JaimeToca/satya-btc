@@ -27,7 +27,7 @@ anyhow = "1"
 futures = "0.3"
 zeromq = "0.6.0"
 # Seeded RNG for the simulation harness only (behind the `simulation` feature).
-rand = { version = "0.8", optional = true }
+rand = { version = "0.10", optional = true }
 
 [features]
 # Compiles the offline mempool/network simulation harness (MockNode,
