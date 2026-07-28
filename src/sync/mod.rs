@@ -128,7 +128,7 @@ async fn maybe_recompute_fees(
     // Deterministic ordering: `g.txs` is a `HashMap`, so iteration order (and
     // thus dense uid assignment / the projection's tie-breaks) would otherwise
     // vary run-to-run for the same mempool contents.
-    snapshot.sort_by(|a, b| a.0.cmp(&b.0));
+    snapshot.sort_by_key(|a| a.0);
     let n = snapshot.len();
     match tokio::task::spawn_blocking(move || crate::fees::compute_estimate(&snapshot, min_fee))
         .await
@@ -523,7 +523,7 @@ async fn fetch_new_entries<R: MempoolRpc + Clone + Send + Sync + 'static>(
             }
         }
     };
-    let mut results = stream::iter(candidates.into_iter())
+    let mut results = stream::iter(candidates)
         .map(|txid| {
             let rpc = rpc.clone();
             async move {
