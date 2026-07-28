@@ -143,10 +143,7 @@ mod tests {
             now
         ));
         // At/after the window (>= RESYNC_COOLDOWN) -> not cooling down (strict `<`).
-        assert!(!resync_cooling_down(
-            Some(now - RESYNC_COOLDOWN),
-            now
-        ));
+        assert!(!resync_cooling_down(Some(now - RESYNC_COOLDOWN), now));
         assert!(!resync_cooling_down(
             Some(now - Duration::from_secs(61)),
             now
@@ -203,7 +200,7 @@ mod tests {
         // Nothing wrong -> not backlog.
         assert!(!is_backlog(0, max, 0, false));
         assert!(!is_backlog(max, max, 0, false)); // == cap, not > cap.
-        // Over the cap -> backlog.
+                                                  // Over the cap -> backlog.
         assert!(is_backlog(max + 1, max, 0, false));
         // Any fetch error -> backlog.
         assert!(is_backlog(0, max, 1, false));

@@ -1,0 +1,34 @@
+name: Feature request
+description: Request a new feature or enhancement for satya
+labels: ["enhancement"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature! Please provide details about what you'd like to see and why.
+
+  - type: textarea
+    id: problem_motivation
+    attributes:
+      label: Problem / motivation
+      description: Describe the problem you're trying to solve or why this feature would be useful.
+      placeholder: Describe the use case or problem...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_solution
+    attributes:
+      label: Proposed solution
+      description: Describe your proposed solution or how this feature should work.
+      placeholder: Describe how this feature should be implemented...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives_considered
+    attributes:
+      label: Alternatives considered
+      description: Describe any alternative solutions or approaches you've considered.
+      placeholder: What other ways could this be solved?
