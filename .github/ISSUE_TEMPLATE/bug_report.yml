@@ -1,0 +1,69 @@
+name: Bug report
+description: Report a bug in satya
+labels: ["bug"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! Please provide as much detail as possible to help us diagnose and fix the issue.
+
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened?
+      description: A clear and concise description of what the bug is.
+      placeholder: Describe the issue you encountered...
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps_to_reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Steps to reproduce the behavior.
+      placeholder: |
+        1. Start satya with...
+        2. Send request to...
+        3. Observe...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected behavior
+      description: A clear and concise description of what you expected to happen.
+      placeholder: What should have happened instead...
+
+  - type: input
+    id: satya_version
+    attributes:
+      label: satya version / commit
+      description: What version or commit of satya are you running?
+      placeholder: e.g., 0.1.0 or abc1234
+
+  - type: input
+    id: bitcoin_core_version
+    attributes:
+      label: Bitcoin Core version
+      description: What version of Bitcoin Core are you using?
+      placeholder: e.g., 27.0
+
+  - type: dropdown
+    id: network
+    attributes:
+      label: Network
+      description: Which network are you using?
+      options:
+        - mainnet
+        - signet
+        - testnet
+        - regtest
+
+  - type: textarea
+    id: relevant_logs
+    attributes:
+      label: Relevant logs
+      description: Please paste any relevant logs here. They will be automatically formatted as code.
+      render: shell

@@ -2,6 +2,11 @@
   <img alt="Satya" src="assets/logo/satya-lockup.svg" width="440">
 </p>
 
+<p align="center">
+  <a href="https://github.com/JaimeToca/satya-btc/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/JaimeToca/satya-btc/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
+</p>
+
 > **Satya** (Sanskrit: *truth*) — the true, live fee your own node sees.
 
 Satya is a single, self-hosted binary that turns your Bitcoin Core node's live
